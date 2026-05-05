@@ -22,3 +22,6 @@
 //! `decrypt_serial` crate.
 
 #![forbid(unsafe_code)]
+
+pub mod consts;
+pub mod format;
