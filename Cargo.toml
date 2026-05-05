@@ -15,6 +15,7 @@ members = [
   # openhcl
   "openhcl/ohcldiag-dev",
   "openhcl/openhcl_boot",
+  "openhcl/openhcl_serial_console_crypto",
   "openhcl/openvmm_hcl",
   "openhcl/sidecar",
   "openhcl/vmfirmwareigvm_dll",
@@ -207,6 +208,7 @@ underhill_entry = { path = "openhcl/underhill_entry" }
 underhill_init = { path = "openhcl/underhill_init" }
 underhill_mem = { path = "openhcl/underhill_mem" }
 openhcl_attestation_protocol = { path = "openhcl/openhcl_attestation_protocol" }
+openhcl_serial_console_crypto = { path = "openhcl/openhcl_serial_console_crypto" }
 openvmm_hcl_resources = { path = "openhcl/openvmm_hcl_resources" }
 openhcl_tdisp = { path = "openhcl/openhcl_tdisp" }
 underhill_threadpool = { path = "openhcl/underhill_threadpool" }

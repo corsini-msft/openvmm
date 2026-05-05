@@ -5115,6 +5115,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "openhcl_serial_console_crypto"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "crypto",
+ "hex",
+ "thiserror 2.0.16",
+ "zerocopy",
+]
+
+[[package]]
 name = "openhcl_tdisp"
 version = "0.0.0"
 dependencies = [

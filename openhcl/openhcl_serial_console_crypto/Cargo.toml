@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "openhcl_serial_console_crypto"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crypto = { workspace = true, features = ["vendored"] }
+
+base64.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.xtask.unused-deps]
+# Keep the crypto dep so we can specify the vendored feature.
+ignored = ["crypto"]
