@@ -30,6 +30,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 disklayer_ram.workspace = true
+getrandom.workspace = true
 tempfile.workspace = true
 zerocopy.workspace = true
 

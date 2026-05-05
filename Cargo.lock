@@ -1166,6 +1166,7 @@ dependencies = [
  "disk_vhd1",
  "disklayer_ram",
  "fs-err",
+ "getrandom 0.3.3",
  "openhcl_attestation_protocol",
  "openhcl_serial_console_crypto",
  "pal_async",
