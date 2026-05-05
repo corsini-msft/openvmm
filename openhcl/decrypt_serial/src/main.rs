@@ -15,6 +15,10 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
+#[expect(dead_code, reason = "wired up by a subsequent commit that adds the CLI")]
+mod key_source;
+
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("decrypt-serial is not yet wired up; subsequent commits add the CLI")
 }
