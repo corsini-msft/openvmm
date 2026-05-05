@@ -1157,7 +1157,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "decrypt_serial"
+name = "decrypt-serial"
 version = "0.1.0"
 dependencies = [
  "anyhow",
