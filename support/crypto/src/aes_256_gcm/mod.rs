@@ -62,14 +62,30 @@ pub struct Aes256GcmEncCtx<'a>(sys::Aes256GcmEncCtxInner<'a>);
 
 impl Aes256GcmEncCtx<'_> {
     /// Encrypts `data` using the provided `iv` and produces the
-    /// authentication tag in `tag`.
+    /// authentication tag in `tag`. Equivalent to
+    /// [`Self::cipher_with_aad`] with an empty AAD.
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
         data: &[u8],
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
-        self.0.cipher(iv, data, tag)
+        self.cipher_with_aad(iv, &[], data, tag)
+    }
+
+    /// Encrypts `data` using the provided `iv` and `aad` (additional
+    /// authenticated data). The AAD is bound to the produced
+    /// authentication tag in `tag` but is not encrypted; the
+    /// decryptor must supply identical AAD bytes or the tag check
+    /// will fail.
+    pub fn cipher_with_aad(
+        &mut self,
+        iv: &[u8; IV_LEN],
+        aad: &[u8],
+        data: &[u8],
+        tag: &mut [u8],
+    ) -> Result<Vec<u8>, Aes256GcmError> {
+        self.0.cipher(iv, aad, data, tag)
     }
 }
 
@@ -78,14 +94,29 @@ pub struct Aes256GcmDecCtx<'a>(sys::Aes256GcmDecCtxInner<'a>);
 
 impl Aes256GcmDecCtx<'_> {
     /// Decrypts `data` using the provided `iv` and verifies the
-    /// authentication `tag`.
+    /// authentication `tag`. Equivalent to
+    /// [`Self::cipher_with_aad`] with an empty AAD.
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
         data: &[u8],
         tag: &[u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
-        self.0.cipher(iv, data, tag)
+        self.cipher_with_aad(iv, &[], data, tag)
+    }
+
+    /// Decrypts `data` using the provided `iv` and verifies the
+    /// authentication `tag` against the supplied `aad` plus `data`.
+    /// `aad` must be byte-for-byte identical to what the encryptor
+    /// supplied or the tag check fails.
+    pub fn cipher_with_aad(
+        &mut self,
+        iv: &[u8; IV_LEN],
+        aad: &[u8],
+        data: &[u8],
+        tag: &[u8],
+    ) -> Result<Vec<u8>, Aes256GcmError> {
+        self.0.cipher(iv, aad, data, tag)
     }
 }
 
@@ -124,5 +155,38 @@ mod tests {
         let mut dec_ctx = aes.decrypt().unwrap();
         let dec_plain = dec_ctx.cipher(&iv, &cipher, &tag).unwrap();
         assert_eq!(dec_plain, plain);
+    }
+
+    #[test]
+    fn test_aes_256_gcm_with_aad() {
+        let key = [0x42u8; KEY_LEN];
+        let iv = [0x55u8; IV_LEN];
+        let aad = b"some authenticated header bytes";
+        let plain = b"the secret payload";
+
+        let aes = Aes256Gcm::new(&key).unwrap();
+        let mut enc_ctx = aes.encrypt().unwrap();
+        let mut tag = vec![0u8; 16];
+        let cipher = enc_ctx
+            .cipher_with_aad(&iv, aad, plain, &mut tag)
+            .unwrap();
+
+        // Decrypt with the same AAD succeeds.
+        let mut dec_ctx = aes.decrypt().unwrap();
+        let decrypted = dec_ctx
+            .cipher_with_aad(&iv, aad, &cipher, &tag)
+            .unwrap();
+        assert_eq!(decrypted, plain);
+
+        // Decrypt with mismatched AAD fails the tag check.
+        let mut dec_ctx = aes.decrypt().unwrap();
+        let result = dec_ctx.cipher_with_aad(&iv, b"different aad", &cipher, &tag);
+        assert!(result.is_err(), "decrypt with wrong AAD must fail");
+
+        // Decrypt with empty AAD when encryption used non-empty AAD
+        // also fails.
+        let mut dec_ctx = aes.decrypt().unwrap();
+        let result = dec_ctx.cipher_with_aad(&iv, &[], &cipher, &tag);
+        assert!(result.is_err(), "decrypt with empty AAD must fail");
     }
 }

@@ -90,12 +90,14 @@ impl Aes256GcmEncCtxInner<'_> {
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
+        aad: &[u8],
         data: &[u8],
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
         let mut crypted_len = 0;
         let mut iv_buffer = iv.to_vec();
         let mut nonce_buffer = iv.to_vec();
+        let mut aad_buffer = aad.to_vec();
         let mut crypted_data = vec![0; data.len()];
 
         let mut auth_mode = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO {
@@ -105,6 +107,12 @@ impl Aes256GcmEncCtxInner<'_> {
             cbNonce: nonce_buffer.len() as u32,
             pbTag: tag.as_mut_ptr(),
             cbTag: tag.len() as u32,
+            pbAuthData: if aad_buffer.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                aad_buffer.as_mut_ptr()
+            },
+            cbAuthData: aad_buffer.len() as u32,
             ..Default::default()
         };
 
@@ -131,12 +139,14 @@ impl Aes256GcmDecCtxInner<'_> {
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
+        aad: &[u8],
         data: &[u8],
         tag: &[u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
         let mut crypted_len = 0;
         let mut iv_buffer = iv.to_vec();
         let mut nonce_buffer = iv.to_vec();
+        let mut aad_buffer = aad.to_vec();
         let mut crypted_data = vec![0; data.len()];
         let mut tag_buffer = tag.to_vec();
 
@@ -147,6 +157,12 @@ impl Aes256GcmDecCtxInner<'_> {
             cbNonce: nonce_buffer.len() as u32,
             pbTag: tag_buffer.as_mut_ptr(),
             cbTag: tag_buffer.len() as u32,
+            pbAuthData: if aad_buffer.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                aad_buffer.as_mut_ptr()
+            },
+            cbAuthData: aad_buffer.len() as u32,
             ..Default::default()
         };
 

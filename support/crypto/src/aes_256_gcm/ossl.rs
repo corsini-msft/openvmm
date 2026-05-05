@@ -55,6 +55,7 @@ impl Aes256GcmEncCtxInner<'_> {
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
+        aad: &[u8],
         data: &[u8],
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
@@ -62,6 +63,11 @@ impl Aes256GcmEncCtxInner<'_> {
         self.ctx
             .encrypt_init(None, None, Some(iv))
             .map_err(|e| err(e, "setting iv for encryption"))?;
+        if !aad.is_empty() {
+            self.ctx
+                .cipher_update(aad, None)
+                .map_err(|e| err(e, "feeding aad for encryption"))?;
+        }
         let count = self
             .ctx
             .cipher_update(data, Some(&mut output))
@@ -82,6 +88,7 @@ impl Aes256GcmDecCtxInner<'_> {
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
+        aad: &[u8],
         data: &[u8],
         tag: &[u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
@@ -89,6 +96,11 @@ impl Aes256GcmDecCtxInner<'_> {
         self.ctx
             .decrypt_init(None, None, Some(iv))
             .map_err(|e| err(e, "setting iv for decryption"))?;
+        if !aad.is_empty() {
+            self.ctx
+                .cipher_update(aad, None)
+                .map_err(|e| err(e, "feeding aad for decryption"))?;
+        }
         let count = self
             .ctx
             .cipher_update(data, Some(&mut output))

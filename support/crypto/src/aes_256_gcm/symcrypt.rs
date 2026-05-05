@@ -40,11 +40,12 @@ impl Aes256GcmEncCtxInner<'_> {
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
+        aad: &[u8],
         data: &[u8],
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
         let mut output = data.to_vec();
-        self.key.encrypt_in_place(iv, &[], &mut output, tag);
+        self.key.encrypt_in_place(iv, aad, &mut output, tag);
         Ok(output)
     }
 }
@@ -53,12 +54,13 @@ impl Aes256GcmDecCtxInner<'_> {
     pub fn cipher(
         &mut self,
         iv: &[u8; IV_LEN],
+        aad: &[u8],
         data: &[u8],
         tag: &[u8],
     ) -> Result<Vec<u8>, Aes256GcmError> {
         let mut output = data.to_vec();
         self.key
-            .decrypt_in_place(iv, &[], &mut output, tag)
+            .decrypt_in_place(iv, aad, &mut output, tag)
             .map_err(|e| err(e, "decrypting data"))?;
         Ok(output)
     }
