@@ -14,8 +14,13 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 #![forbid(unsafe_code)]
 
+// These modules are wired up by the next commit (`cli-main`); silence
+// the transitional dead_code warnings until then.
 #[cfg(target_os = "linux")]
-#[expect(dead_code, reason = "wired up by a subsequent commit that adds the CLI")]
+#[allow(dead_code)]
+mod decrypt;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod key_source;
 
 #[cfg(target_os = "linux")]
