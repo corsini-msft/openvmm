@@ -20,8 +20,17 @@
 //! depend on it without inheriting CLI, filesystem, async, or VMGS
 //! dependencies. The host-side decryptor CLI lives in the separate
 //! `decrypt_serial` crate.
+//!
+//! The crate is currently Linux-only, matching the
+//! `openhcl/underhill_attestation` pattern, because
+//! `crypto::kdf::kbkdf_hmac_sha256` is implemented via the Unix-only
+//! `openssl_kdf` crate in the workspace. Host-side tooling that
+//! depends on this crate (notably `decrypt_serial`) is therefore
+//! Linux-only too. Windows users can run the tool from WSL2.
 
+#![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 
 pub mod consts;
+pub mod crypto;
 pub mod format;

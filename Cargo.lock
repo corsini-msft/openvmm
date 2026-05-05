@@ -5122,7 +5122,6 @@ dependencies = [
  "crypto",
  "hex",
  "thiserror 2.0.16",
- "zerocopy",
 ]
 
 [[package]]
