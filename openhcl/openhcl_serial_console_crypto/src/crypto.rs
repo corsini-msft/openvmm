@@ -46,9 +46,8 @@ pub fn derive_aes_key(
     gks: &GksKeyMaterial,
     session_id: &[u8; SESSION_ID_LEN],
 ) -> Result<[u8; AES_KEY_LEN], CryptoError> {
-    let derived =
-        crypto::kdf::kbkdf_hmac_sha256(&gks.0, KDF_LABEL, session_id, AES_KEY_LEN)
-            .map_err(CryptoError::Kdf)?;
+    let derived = crypto::kdf::kbkdf_hmac_sha256(&gks.0, KDF_LABEL, session_id, AES_KEY_LEN)
+        .map_err(CryptoError::Kdf)?;
     let arr: [u8; AES_KEY_LEN] = derived
         .as_slice()
         .try_into()
@@ -238,7 +237,10 @@ mod tests {
         let session_b = [0x02u8; SESSION_ID_LEN];
         let key_a = derive_aes_key(&gks, &session_a).unwrap();
         let key_b = derive_aes_key(&gks, &session_b).unwrap();
-        assert_ne!(key_a, key_b, "different sessions must derive different keys");
+        assert_ne!(
+            key_a, key_b,
+            "different sessions must derive different keys"
+        );
 
         let nonce = [0x88u8; NONCE_LEN];
         let plain = b"x";

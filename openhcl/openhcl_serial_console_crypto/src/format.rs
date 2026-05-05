@@ -25,9 +25,9 @@ use crate::consts::MAX_PLAINTEXT_LEN;
 use crate::consts::MAX_SENTINEL_BASE64_LEN;
 use crate::consts::MIN_PAYLOAD_LEN;
 use crate::consts::NONCE_LEN;
-use crate::consts::SESSION_ID_LEN;
 use crate::consts::SENTINEL_CLOSE;
 use crate::consts::SENTINEL_OPEN;
+use crate::consts::SESSION_ID_LEN;
 use crate::consts::TAG_LEN;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -83,9 +83,8 @@ impl Record {
     /// Serialize the binary record payload (the bytes that go inside
     /// the sentinel before base64-encoding).
     pub fn encode_payload(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            SESSION_ID_LEN + 8 + NONCE_LEN + self.ciphertext.len() + TAG_LEN,
-        );
+        let mut out =
+            Vec::with_capacity(SESSION_ID_LEN + 8 + NONCE_LEN + self.ciphertext.len() + TAG_LEN);
         out.extend_from_slice(&self.session_id);
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.nonce);
@@ -123,9 +122,7 @@ impl Record {
 
         let tag_offset = bytes.len() - TAG_LEN;
         let ciphertext = bytes[CIPHERTEXT_OFFSET..tag_offset].to_vec();
-        let tag: [u8; TAG_LEN] = bytes[tag_offset..]
-            .try_into()
-            .expect("range checked above");
+        let tag: [u8; TAG_LEN] = bytes[tag_offset..].try_into().expect("range checked above");
 
         if ciphertext.len() > MAX_PLAINTEXT_LEN {
             return Err(ParseError::CiphertextTooLong {
@@ -334,8 +331,8 @@ mod tests {
     fn sample_record(ciphertext: Vec<u8>) -> Record {
         Record {
             session_id: [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-                0x0e, 0x0f, 0x10,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
             ],
             seq: 0x1122_3344_5566_7788,
             nonce: [
@@ -343,8 +340,8 @@ mod tests {
             ],
             ciphertext,
             tag: [
-                0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
-                0x3e, 0x3f, 0x40,
+                0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
+                0x3f, 0x40,
             ],
         }
     }

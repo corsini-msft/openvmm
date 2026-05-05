@@ -189,7 +189,11 @@ fn handle_failure(
     if strict {
         bail!("encrypted-serial record at offset {offset} failed: {reason}");
     }
-    tracing::warn!(offset, reason, "encrypted-serial record could not be decoded");
+    tracing::warn!(
+        offset,
+        reason,
+        "encrypted-serial record could not be decoded"
+    );
     write!(output, "<<decrypt failed offset={offset} reason={reason}>>")
         .context("writing decrypt-failed marker to output")?;
     Ok(())

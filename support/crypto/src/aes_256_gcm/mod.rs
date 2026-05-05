@@ -167,15 +167,11 @@ mod tests {
         let aes = Aes256Gcm::new(&key).unwrap();
         let mut enc_ctx = aes.encrypt().unwrap();
         let mut tag = vec![0u8; 16];
-        let cipher = enc_ctx
-            .cipher_with_aad(&iv, aad, plain, &mut tag)
-            .unwrap();
+        let cipher = enc_ctx.cipher_with_aad(&iv, aad, plain, &mut tag).unwrap();
 
         // Decrypt with the same AAD succeeds.
         let mut dec_ctx = aes.decrypt().unwrap();
-        let decrypted = dec_ctx
-            .cipher_with_aad(&iv, aad, &cipher, &tag)
-            .unwrap();
+        let decrypted = dec_ctx.cipher_with_aad(&iv, aad, &cipher, &tag).unwrap();
         assert_eq!(decrypted, plain);
 
         // Decrypt with mismatched AAD fails the tag check.

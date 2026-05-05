@@ -82,9 +82,7 @@ async fn read_gks_from_disk(disk: Disk) -> anyhow::Result<GksKeyMaterial> {
 
 fn bytes_to_gks(bytes: &[u8], source: &str) -> anyhow::Result<GksKeyMaterial> {
     if bytes.is_empty() {
-        bail!(
-            "{source} is empty; expected up to {GKS_LEN} bytes of GuestSecretKey material"
-        );
+        bail!("{source} is empty; expected up to {GKS_LEN} bytes of GuestSecretKey material");
     }
     if bytes.len() > GKS_LEN {
         bail!(
@@ -140,10 +138,7 @@ mod tests {
     fn key_file_empty_rejected() {
         let f = write_temp_key(&[]);
         let err = read_key_file(f.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("empty"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
     }
 
     #[test]

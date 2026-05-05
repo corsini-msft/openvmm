@@ -126,8 +126,7 @@ fn main() -> anyhow::Result<()> {
 
     for (seq, chunk) in plaintext.chunks(args.chunk_size).enumerate() {
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| anyhow::anyhow!("generating random nonce: {e}"))?;
+        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("generating random nonce: {e}"))?;
         let (ciphertext, tag) = encrypt(&aes_key, &session_id, seq as u64, &nonce, chunk)
             .context("encrypting chunk")?;
         let record = Record {

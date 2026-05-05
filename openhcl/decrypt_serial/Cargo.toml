@@ -3,7 +3,6 @@
 
 [package]
 name = "decrypt-serial"
-version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -24,7 +23,6 @@ vmgs_format.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 fs-err.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
