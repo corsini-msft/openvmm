@@ -1157,6 +1157,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "decrypt_serial"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "disk_backend",
+ "disk_vhd1",
+ "disklayer_ram",
+ "fs-err",
+ "openhcl_attestation_protocol",
+ "openhcl_serial_console_crypto",
+ "pal_async",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tracing",
+ "tracing-subscriber",
+ "vmgs",
+ "vmgs_format",
+]
+
+[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"

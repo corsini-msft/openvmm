@@ -13,6 +13,7 @@ members = [
   "flowey/flowey_hvlite",
   "xtask",
   # openhcl
+  "openhcl/decrypt_serial",
   "openhcl/ohcldiag-dev",
   "openhcl/openhcl_boot",
   "openhcl/openhcl_serial_console_crypto",
@@ -209,6 +210,7 @@ underhill_init = { path = "openhcl/underhill_init" }
 underhill_mem = { path = "openhcl/underhill_mem" }
 openhcl_attestation_protocol = { path = "openhcl/openhcl_attestation_protocol" }
 openhcl_serial_console_crypto = { path = "openhcl/openhcl_serial_console_crypto" }
+decrypt_serial = { path = "openhcl/decrypt_serial" }
 openvmm_hcl_resources = { path = "openhcl/openvmm_hcl_resources" }
 openhcl_tdisp = { path = "openhcl/openhcl_tdisp" }
 underhill_threadpool = { path = "openhcl/underhill_threadpool" }
