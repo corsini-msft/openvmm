@@ -28,7 +28,6 @@
 //! depends on this crate (notably `decrypt_serial`) is therefore
 //! Linux-only too. Windows users can run the tool from WSL2.
 
-#![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 
 pub mod consts;

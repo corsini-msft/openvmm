@@ -2305,24 +2305,53 @@ async fn new_underhill_vm(
 
     let mut serial_inputs = [None, None, None, None];
 
+    // TODO(encrypted-serial-poc): Stub test key for development. Replace
+    // with real GSK from platform_attestation_data before production.
+    let encrypted_serial_gks = {
+        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        Some(Arc::new(
+            openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf),
+        ))
+    };
+
+    if let Some(gks) = encrypted_serial_gks.clone() {
+        tracing::info!("registering encrypted serial backend resolver");
+        resolver.add_async_resolver(
+            crate::emuplat::encrypted_serial::EncryptedSerialBackendResolver { gks },
+        );
+    }
+
     if dps.general.com1_vmbus_redirector {
-        serial_inputs[0] = Some(Resource::new(
+        let inner = Resource::new(
             vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
                 &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM1,
                 dps.general.management_vtl_features.tx_only_serial_port(),
             )
             .context("failed to open com1")?,
-        ));
+        );
+        serial_inputs[0] = Some(if encrypted_serial_gks.is_some() {
+            Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
+        } else {
+            inner
+        });
     }
 
     if dps.general.com2_vmbus_redirector {
-        serial_inputs[1] = Some(Resource::new(
+        let inner = Resource::new(
             vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
                 &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM2,
                 dps.general.management_vtl_features.tx_only_serial_port(),
             )
             .context("failed to open com2")?,
-        ));
+        );
+        serial_inputs[1] = Some(if encrypted_serial_gks.is_some() {
+            Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
+        } else {
+            inner
+        });
     }
 
     let with_serial = serial_inputs.iter().any(|transport| transport.is_some());

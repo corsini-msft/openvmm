@@ -10,12 +10,13 @@ rust-version.workspace = true
 # to Linux because of the workspace's openssl_kdf dependency. Mirror
 # that here so the workspace builds on Windows / macOS without trying
 # to compile the CLI's transitive openssl-only deps.
-[target.'cfg(target_os = "linux")'.dependencies]
+[dependencies]
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
 
 disk_backend.workspace = true
 disk_vhd1.workspace = true
+getrandom.workspace = true
 pal_async.workspace = true
 vmgs.workspace = true
 vmgs_format.workspace = true
@@ -26,9 +27,8 @@ fs-err.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[dev-dependencies]
 disklayer_ram.workspace = true
-getrandom.workspace = true
 tempfile.workspace = true
 zerocopy.workspace = true
 

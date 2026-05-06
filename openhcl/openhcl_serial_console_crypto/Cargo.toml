@@ -6,17 +6,12 @@ name = "openhcl_serial_console_crypto"
 edition.workspace = true
 rust-version.workspace = true
 
-# This crate uses crypto::kdf::kbkdf_hmac_sha256, which is implemented
-# via openssl_kdf and therefore Unix-only in the workspace. We follow
-# the same pattern as openhcl/underhill_attestation and gate the
-# crate to Linux to keep the workspace buildable everywhere else.
-[target.'cfg(target_os = "linux")'.dependencies]
+[dependencies]
 crypto.workspace = true
-
 base64.workspace = true
 thiserror.workspace = true
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[dev-dependencies]
 hex.workspace = true
 
 [lints]
