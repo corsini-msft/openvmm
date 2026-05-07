@@ -26,11 +26,11 @@ clap = { workspace = true, features = ["derive"] }
 fs-err.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zerocopy.workspace = true
 
 [dev-dependencies]
 disklayer_ram.workspace = true
 tempfile.workspace = true
-zerocopy.workspace = true
 
 [lints]
 workspace = true

@@ -145,6 +145,35 @@ cargo run -p decrypt-serial -- \
 diff my.log recovered.log
 ```
 
+## Provisioning a GSK in a VMGS for testing
+
+Real GSK provisioning happens through CPS / attestation flows. For a
+PoC where you want OpenHCL VTL2 itself (not just the `encrypt_fixture`
+helper) to emit encrypted serial, you can seed `FileId::GUEST_SECRET_KEY`
+in a plaintext development VMGS with the `provision-gsk` subcommand.
+
+> ⚠ This is a **developer-only** path. It writes raw bytes into the
+> GSK slot and does **not** produce a TPM2_Import-shaped duplicate
+> blob. The vTPM first-boot import will fail against a VMGS provisioned
+> this way, so use it only for VMs that don't exercise vTPM
+> provisioning. Encrypted VMGS files are rejected up front.
+
+```sh
+# Generate fresh random GSK material directly into the VMGS.
+decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-random
+
+# Or, write specific bytes (≤ 2048; zero-padded if shorter).
+decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-key gks.bin
+
+# Overwriting an existing slot requires --force.
+decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-random --force
+```
+
+Once provisioned, the same `--vmgs` file can be passed back to
+`decrypt-serial decrypt` (or the streaming subcommands) so the host-side
+tool reads exactly the bytes the producer in OpenHCL VTL2 will derive
+its AES key from.
+
 ## When the producer ships
 
 The follow-up PR that adds the VTL2 producer side should:
