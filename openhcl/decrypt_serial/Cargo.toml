@@ -11,6 +11,7 @@ rust-version.workspace = true
 # that here so the workspace builds on Windows / macOS without trying
 # to compile the CLI's transitive openssl-only deps.
 [dependencies]
+build_info.workspace = true
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
 
@@ -31,6 +32,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 disklayer_ram.workspace = true
 tempfile.workspace = true
 zerocopy.workspace = true
+
+[build-dependencies]
+build_rs_git_info.workspace = true
 
 [lints]
 workspace = true

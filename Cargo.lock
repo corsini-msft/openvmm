@@ -1161,6 +1161,8 @@ name = "decrypt-serial"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "build_info",
+ "build_rs_git_info",
  "clap",
  "disk_backend",
  "disk_vhd1",

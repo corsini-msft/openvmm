@@ -136,7 +136,11 @@ fn stream_decrypt_io<R: BufRead, W: Write>(
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
 
-    info!("stream-decrypt started");
+    info!(
+        sha = build_info::get().scm_revision(),
+        branch = build_info::get().scm_branch(),
+        "stream-decrypt started",
+    );
 
     loop {
         let n = {

@@ -36,6 +36,10 @@ enum Commands {
     /// Stream-encrypt from stdin, writing encrypted records to stdout.
     /// Reads line-by-line for live pipe usage.
     StreamEncrypt(StreamKeyArgs),
+    /// Print build info (git SHA, branch, wire-format version) and exit.
+    /// Useful for verifying that a freshly-built binary actually contains
+    /// a specific change rather than a stale cached binary.
+    Version,
 }
 
 #[derive(clap::Args, Debug)]
@@ -102,7 +106,7 @@ fn main() -> std::process::ExitCode {
             1 => "decrypt_serial=debug,info",
             _ => "decrypt_serial=trace,info",
         },
-        Commands::Decrypt(_) => "info",
+        Commands::Decrypt(_) | Commands::Version => "info",
     };
 
     tracing_subscriber::fmt()
@@ -117,7 +121,43 @@ fn main() -> std::process::ExitCode {
         Commands::Decrypt(args) => run_decrypt(&args),
         Commands::StreamDecrypt(args) => run_stream_decrypt(&args),
         Commands::StreamEncrypt(args) => run_stream_encrypt(&args),
+        Commands::Version => run_version(),
     }
+}
+
+/// Distinctive feature marker for this build. Bump when the wire
+/// format or scanner contract changes meaningfully so users can
+/// tell apart "old binary" vs "new binary" without grepping for a
+/// SHA. Current values:
+///
+/// - `v1-back-to-back-no-lf`: producer emits records back-to-back
+///   on the wire with no inter-record `\n`; consumer is a streaming
+///   sentinel scanner that doesn't depend on any in-band delimiter.
+const FEATURE_MARKER: &str = "v1-back-to-back-no-lf";
+
+fn run_version() -> std::process::ExitCode {
+    let info = build_info::get();
+    println!("decrypt-serial");
+    println!("  package version: {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  git sha:         {}",
+        if info.scm_revision().is_empty() {
+            "(unknown — built outside a git checkout?)"
+        } else {
+            info.scm_revision()
+        }
+    );
+    println!(
+        "  git branch:      {}",
+        if info.scm_branch().is_empty() {
+            "(unknown)"
+        } else {
+            info.scm_branch()
+        }
+    );
+    println!("  wire format:     {FEATURE_MARKER}");
+    println!("  features:        --verbose, streaming sentinel scanner");
+    std::process::ExitCode::SUCCESS
 }
 
 fn resolve_key(
