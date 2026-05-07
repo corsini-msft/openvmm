@@ -228,16 +228,18 @@ pub fn init_tracing(spawn: impl Spawn, tracer: RemoteTracer) -> anyhow::Result<(
         .with_span_events(span_events)
         .with_writer(kmsg_writer);
 
-    // Filter out events that aren't allowed for CVMs, when filtering is enabled.
+    // Filter out CVM_CONFIDENTIAL events from the JSON/GET layer (they
+    // would be sent to the host in plaintext). The kmsg layer handles
+    // them by encrypting instead of blocking.
     let cvm_filter = underhill_confidentiality::confidential_filtering_enabled()
         .then(cvm_tracing::confidential_event_filter);
+    let json_fmt_layer = json_fmt_layer.with_filter(cvm_filter);
 
     let output_layers = json_fmt_layer.and_then(kmsg_layer);
-    let with_cvm_filter = output_layers.with_filter(cvm_filter);
 
     // Filter events based on the updatable-via-inspect target filter.
     // Make sure this is the outermost layer for performance reasons.
-    let (combined, update_fut) = tracer.trace_filter.apply(with_cvm_filter, |filter| {
+    let (combined, update_fut) = tracer.trace_filter.apply(output_layers, |filter| {
         let targets = filter.parse::<tracing_subscriber::filter::Targets>()?;
         if targets
             .default_level()

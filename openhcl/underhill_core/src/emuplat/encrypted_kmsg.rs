@@ -72,11 +72,12 @@ impl EncryptingKmsgWriter {
 
 /// Writer returned by [`EncryptingKmsgWriter::make_writer_for`].
 ///
-/// Encrypts the message body, then delegates to the inner
-/// [`kmsg_writer::KmsgWithPrefix`] writer.
+/// When `encrypt` is true, encrypts the message body. Otherwise
+/// passes through to the inner writer as plaintext.
 pub struct EncryptingKmsgWithPrefix<'a> {
     inner_writer: kmsg_writer::KmsgWithPrefix<'a>,
     state: Arc<Mutex<EncryptState>>,
+    encrypt: bool,
 }
 
 impl<'a> MakeWriter<'a> for EncryptingKmsgWriter {
@@ -86,19 +87,28 @@ impl<'a> MakeWriter<'a> for EncryptingKmsgWriter {
         EncryptingKmsgWithPrefix {
             inner_writer: self.inner.make_writer(),
             state: self.state.clone(),
+            encrypt: false, // default: no encryption for untagged events
         }
     }
 
     fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        // Only encrypt events tagged with CVM_CONFIDENTIAL.
+        let encrypt = meta.fields().field("CVM_CONFIDENTIAL").is_some();
         EncryptingKmsgWithPrefix {
             inner_writer: self.inner.make_writer_for(meta),
             state: self.state.clone(),
+            encrypt,
         }
     }
 }
 
 impl Write for EncryptingKmsgWithPrefix<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.encrypt {
+            // Pass through as plaintext for non-confidential events.
+            return self.inner_writer.write(buf);
+        }
+
         let plaintext_len = buf.len();
 
         // Truncate to max plaintext size before encrypting.
