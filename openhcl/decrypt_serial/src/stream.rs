@@ -41,6 +41,10 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::io::Write;
 use std::path::PathBuf;
+use tracing::debug;
+use tracing::info;
+use tracing::trace;
+use tracing::warn;
 
 /// Read plaintext from stdin, encrypt each line, and write
 /// `[[OHENC v1 ...]]` records to stdout.
@@ -129,24 +133,53 @@ fn stream_decrypt_io<R: BufRead, W: Write>(
 ) -> anyhow::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     let mut keys = HashMap::<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>::new();
+    let mut total_in: u64 = 0;
+    let mut total_out: u64 = 0;
+
+    info!("stream-decrypt started");
 
     loop {
         let n = {
             let chunk = reader.fill_buf().context("reading input")?;
             if chunk.is_empty() {
-                // EOF — drain whatever's left, treating any in-flight
-                // sentinel as malformed (pass through byte-by-byte
-                // rather than silently dropping data).
-                drain_buffer(&mut buf, &mut keys, gks, writer, /* at_eof */ true)?;
+                info!(
+                    total_in,
+                    total_out,
+                    sessions = keys.len(),
+                    "stream-decrypt EOF",
+                );
+                drain_buffer(
+                    &mut buf,
+                    &mut keys,
+                    gks,
+                    writer,
+                    &mut total_out,
+                    /* at_eof */ true,
+                )?;
                 writer.flush().context("flushing output")?;
                 return Ok(());
             }
+            debug!(
+                bytes = chunk.len(),
+                buf_before = buf.len(),
+                buf_after = buf.len() + chunk.len(),
+                "fill_buf",
+            );
+            trace!(hex = ?HexSlice(chunk), "fill_buf bytes");
             buf.extend_from_slice(chunk);
             chunk.len()
         };
         reader.consume(n);
+        total_in += n as u64;
 
-        drain_buffer(&mut buf, &mut keys, gks, writer, /* at_eof */ false)?;
+        drain_buffer(
+            &mut buf,
+            &mut keys,
+            gks,
+            writer,
+            &mut total_out,
+            /* at_eof */ false,
+        )?;
         writer.flush().context("flushing output")?;
     }
 }
@@ -162,6 +195,7 @@ fn drain_buffer<W: Write>(
     keys: &mut HashMap<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>,
     gks: &GksKeyMaterial,
     writer: &mut W,
+    total_out: &mut u64,
     at_eof: bool,
 ) -> anyhow::Result<()> {
     let mut cursor = 0;
@@ -173,11 +207,21 @@ fn drain_buffer<W: Write>(
                 payload,
             } => {
                 if start > cursor {
+                    let n = start - cursor;
+                    debug!(bytes = n, "passthrough before sentinel");
                     writer
                         .write_all(&buf[cursor..start])
                         .context("writing passthrough")?;
+                    *total_out += n as u64;
                 }
-                decrypt_and_write(gks, keys, &payload, writer)?;
+                let n = decrypt_and_write(gks, keys, &payload, writer)?;
+                *total_out += n as u64;
+                debug!(
+                    sentinel_start = start,
+                    sentinel_len = end - start,
+                    plaintext_bytes = n,
+                    "decrypt OK",
+                );
                 cursor = end;
             }
             SentinelMatch::Malformed { start, reason } => {
@@ -195,22 +239,37 @@ fn drain_buffer<W: Write>(
                 };
 
                 if needs_more {
+                    debug!(
+                        opener_at = start,
+                        buf_len = buf.len(),
+                        "in-flight sentinel — waiting for more bytes",
+                    );
                     if start > cursor {
+                        let n = start - cursor;
+                        debug!(bytes = n, "passthrough before in-flight sentinel");
                         writer
                             .write_all(&buf[cursor..start])
                             .context("writing passthrough")?;
+                        *total_out += n as u64;
                     }
                     cursor = start;
                     break;
                 } else {
+                    warn!(
+                        opener_at = start,
+                        ?reason,
+                        "malformed sentinel — passing 1 byte through and resuming scan",
+                    );
                     // Truly malformed (or EOF interrupted). Pass
                     // through one byte and resume scanning so a
                     // subsequent inner sentinel can still be
                     // recognised.
                     let pass_end = (start + 1).min(buf.len());
+                    let n = pass_end - cursor;
                     writer
                         .write_all(&buf[cursor..pass_end])
                         .context("writing passthrough")?;
+                    *total_out += n as u64;
                     cursor = pass_end;
                 }
             }
@@ -224,9 +283,16 @@ fn drain_buffer<W: Write>(
                     buf.len().saturating_sub(SENTINEL_OPEN.len() - 1)
                 };
                 if safe > cursor {
+                    let n = safe - cursor;
+                    debug!(
+                        bytes = n,
+                        held_back = buf.len() - safe,
+                        "passthrough (no sentinel found)",
+                    );
                     writer
                         .write_all(&buf[cursor..safe])
                         .context("writing passthrough")?;
+                    *total_out += n as u64;
                     cursor = safe;
                 }
                 break;
@@ -240,15 +306,20 @@ fn drain_buffer<W: Write>(
 /// Decrypt one parsed payload and write its plaintext (or an
 /// inline error marker) to `writer`. AES key material is cached
 /// per `session_id` so repeated records reuse the KDF result.
+/// Returns the number of bytes written to `writer`.
 fn decrypt_and_write<W: Write>(
     gks: &GksKeyMaterial,
     keys: &mut HashMap<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>,
     payload: &[u8],
     writer: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     match Record::parse_payload(payload) {
         Ok(record) => {
             let key = keys.entry(record.session_id).or_insert_with(|| {
+                debug!(
+                    session_id = ?HexSlice(&record.session_id),
+                    "deriving key for new session",
+                );
                 derive_aes_key(gks, &record.session_id).expect("KDF should not fail")
             });
             match openhcl_serial_console_crypto::crypto::decrypt(
@@ -261,17 +332,54 @@ fn decrypt_and_write<W: Write>(
             ) {
                 Ok(plaintext) => {
                     writer.write_all(&plaintext).context("writing decrypted")?;
+                    Ok(plaintext.len())
                 }
                 Err(e) => {
-                    write!(writer, "<<decrypt failed: {e}>>").context("writing error marker")?;
+                    warn!(
+                        seq = record.seq,
+                        ciphertext_len = record.ciphertext.len(),
+                        error = ?e,
+                        "decrypt failed",
+                    );
+                    let marker = format!("<<decrypt failed: {e}>>");
+                    writer
+                        .write_all(marker.as_bytes())
+                        .context("writing error marker")?;
+                    Ok(marker.len())
                 }
             }
         }
         Err(e) => {
-            write!(writer, "<<parse failed: {e}>>").context("writing parse error")?;
+            warn!(error = ?e, payload_len = payload.len(), "parse failed");
+            let marker = format!("<<parse failed: {e}>>");
+            writer
+                .write_all(marker.as_bytes())
+                .context("writing parse error")?;
+            Ok(marker.len())
         }
     }
-    Ok(())
+}
+
+/// Helper for hex-formatting byte slices in trace logs. Truncates
+/// long slices to keep logs readable.
+struct HexSlice<'a>(&'a [u8]);
+
+impl std::fmt::Debug for HexSlice<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MAX: usize = 64;
+        let bytes = if self.0.len() > MAX {
+            &self.0[..MAX]
+        } else {
+            self.0
+        };
+        for b in bytes {
+            write!(f, "{:02x}", b)?;
+        }
+        if self.0.len() > MAX {
+            write!(f, "... ({} more bytes)", self.0.len() - MAX)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
