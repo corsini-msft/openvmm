@@ -2309,24 +2309,24 @@ async fn new_underhill_vm(
 
     let mut serial_inputs = [None, None, None, None];
 
-    // Source the encrypted-serial GKS from the same VMGS slot that
-    // attestation already populated (`FileId::GUEST_SECRET_KEY`).
-    // The bytes are zero-padded to `GKS_LEN` to match the
-    // `read_guest_secret_key` behavior. If the slot is empty (no GSK
-    // provisioned in this VMGS) we leave serial as plaintext rather
-    // than panic — see `encrypted-serial provision-gsk` for the dev
-    // path that seeds a VMGS.
-    //
-    // Setting `OPENHCL_DISABLE_ENCRYPTED_SERIAL=1` short-circuits the
-    // VMGS lookup entirely and forces plaintext serial. Useful for
-    // debugging the underlying transport in isolation from the
-    // encryption wrapper.
+    // Check if encrypted diagnostics is enabled via VTL2 settings.
+    // The env var `OPENHCL_DISABLE_ENCRYPTED_SERIAL=1` overrides
+    // the setting for debugging.
+    let encrypted_diagnostics = !env_cfg.disable_encrypted_serial
+        && dps
+            .general
+            .vtl2_settings
+            .as_ref()
+            .is_some_and(|s| s.fixed.encrypted_diagnostics);
+
+    // Source the encrypted-serial GSK from the VMGS when enabled.
+    // Falls back to plaintext if the GSK is not provisioned.
     let encrypted_serial_gks = if env_cfg.disable_encrypted_serial {
         tracing::info!(
             "OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper"
         );
         None
-    } else {
+    } else if encrypted_diagnostics {
         match platform_attestation_data.guest_secret_key.as_deref() {
             Some(bytes) if !bytes.is_empty() => {
                 let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
@@ -2345,11 +2345,14 @@ async fn new_underhill_vm(
             }
             _ => {
                 tracing::info!(
-                    "no GUEST_SECRET_KEY provisioned in VMGS; encrypted serial disabled (plaintext)"
+                    "encrypted_diagnostics enabled but no GUEST_SECRET_KEY in VMGS; \
+                     encrypted serial disabled (plaintext)"
                 );
                 None
             }
         }
+    } else {
+        None
     };
 
     if let Some(gks) = encrypted_serial_gks.clone() {

@@ -181,6 +181,8 @@ pub struct Vtl2SettingsFixed {
     pub io_ring_size: u32,
     /// Max bounce buffer pages active per cpu
     pub max_bounce_buffer_pages: Option<u32>,
+    /// Enable encrypted diagnostics (serial output + trace messages)
+    pub encrypted_diagnostics: bool,
 }
 
 #[derive(Debug, Clone, MeshPayload, Inspect)]
