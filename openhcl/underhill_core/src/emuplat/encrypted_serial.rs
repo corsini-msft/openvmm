@@ -53,7 +53,7 @@ impl ResourceId<SerialBackendHandle> for EncryptedSerialBackendHandle {
     const ID: &'static str = "encrypted_serial";
 }
 
-/// Resolver for [`EncryptedSerialBackendHandle`]. Holds the GKS key
+/// Resolver for [`EncryptedSerialBackendHandle`]. Holds the GSK key
 /// material used for AES-256-GCM key derivation.
 pub struct EncryptedSerialBackendResolver {
     /// The guest secret key material used to derive per-session AES keys.

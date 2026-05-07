@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 diag_client.workspace = true
+openhcl_serial_console_crypto.workspace = true
 
 clap_dyn_complete.workspace = true
 inspect.workspace = true
