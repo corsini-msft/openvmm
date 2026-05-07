@@ -333,12 +333,23 @@ impl AsyncRead for EncryptingSerialIo {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        // Mirror the deadline poll on the read path so an idle UART
-        // (no concurrent writes) still wakes us when the flush
-        // deadline expires. `Serial16550::poll_rx` polls us
-        // continuously, so registering the timer waker here is
-        // enough to drive the idle flush.
-        self.poll_flush_deadline(cx)?;
+        // Drive any pending encrypted output (and the idle-flush
+        // deadline check baked into `poll_drain_output`) on every
+        // read. Crucially, this is what gets encrypted bytes onto
+        // the wire when the *timer* (not a fresh write) is the only
+        // event that fired: the timer waker wakes the task that
+        // owns Serial16550, which re-polls poll_rx, which calls us
+        // here. Without the drain on this path, partial writes that
+        // hit only the idle-flush trigger get encrypted into
+        // `output_buf` but never make it to the inner transport,
+        // so the consumer sees nothing past the most recent
+        // soft-threshold flush.
+        //
+        // Errors propagate; Pending from the write side does NOT
+        // block the read path — they're independent operations.
+        if let Poll::Ready(Err(e)) = self.poll_drain_output(cx) {
+            return Poll::Ready(Err(e));
+        }
 
         // Pass through reads unmodified.
         Pin::new(&mut *self.inner).poll_read(cx, buf)
@@ -349,7 +360,9 @@ impl AsyncRead for EncryptingSerialIo {
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.poll_flush_deadline(cx)?;
+        if let Poll::Ready(Err(e)) = self.poll_drain_output(cx) {
+            return Poll::Ready(Err(e));
+        }
         Pin::new(&mut *self.inner).poll_read_vectored(cx, bufs)
     }
 }
@@ -600,6 +613,50 @@ mod tests {
             count_subseq(&bytes, SENTINEL_OPEN),
             1,
             "expected the buffered partial write to flush after the idle timeout"
+        );
+    }
+
+    #[async_test]
+    async fn idle_flush_drains_on_poll_read(driver: DefaultDriver) {
+        // Production path: in OpenHCL, Serial16550::poll_tx is only
+        // called when the guest pushes bytes into the UART's TX
+        // FIFO. After the idle timer fires there's no fresh write,
+        // so the *only* thing the timer waker can wake is poll_rx
+        // → our poll_read. This test reproduces that exact path:
+        // write a sub-threshold amount, wait past the deadline,
+        // then drive a single poll_read (which would normally come
+        // from Serial16550::poll_rx). The encrypted record must
+        // appear on the inner transport WITHOUT a poll_flush ever
+        // being called.
+        use futures::AsyncRead;
+        use std::future::poll_fn;
+
+        let (mut wrapper, captured) = make_wrapper(&driver);
+
+        wrapper.write_all(b"partial").await.unwrap();
+        assert_eq!(captured.lock().len(), 0);
+
+        let mut sleeper = PolledTimer::new(&driver);
+        sleeper
+            .sleep(PRODUCER_IDLE_FLUSH + Duration::from_millis(20))
+            .await;
+
+        // Drive a single poll_read. The inner CapturingBackend
+        // returns Poll::Pending for reads, so the outer future
+        // also returns Pending — but the side effect (drain of
+        // output_buf) has already happened by then.
+        poll_fn(|cx| {
+            let mut buf = [0u8; 16];
+            let _ = Pin::new(&mut wrapper).poll_read(cx, &mut buf);
+            Poll::Ready(())
+        })
+        .await;
+
+        let bytes = captured.lock().clone();
+        assert_eq!(
+            count_subseq(&bytes, SENTINEL_OPEN),
+            1,
+            "poll_read must drain output_buf so timer-driven flushes reach the wire"
         );
     }
 
