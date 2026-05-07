@@ -2,20 +2,26 @@
 // Licensed under the MIT License.
 
 //! Developer-only helper to seed `FileId::GUEST_SECRET_KEY` in a
-//! plaintext VMGS file with key material that the encrypted-serial
-//! producer (in OpenHCL VTL2) and the `decrypt-serial` consumer can
-//! share.
+//! plaintext VMGS file with a TPM2_Import-shaped duplicate blob that
+//! the encrypted-serial producer (in OpenHCL VTL2) and the
+//! `decrypt-serial` consumer can share.
 //!
 //! ⚠ **Not a production provisioning tool.** Real GSK provisioning
 //! happens through CPS / attestation flows. This subcommand exists
 //! solely so a developer can stand up a working PoC without those
-//! flows by writing GSK bytes directly into a plaintext VMGS file.
+//! flows by writing a developer-supplied importable blob directly
+//! into a plaintext VMGS file.
 //!
-//! The bytes written are interpreted as the raw KBKDF input by the
-//! encrypted-serial consumer; they do **not** need to be (and by
-//! default are not) a TPM2_Import-shaped duplicate blob. If the same
-//! VMGS is also consumed by the vTPM at first boot, the import will
-//! fail; that path is out of scope for the encrypted-serial PoC.
+//! The bytes written must parse via
+//! `tpm_protocol::tpm20proto::ImportCmd::deserialize_no_wrapping_key`
+//! — i.e. they must form a valid TPM2_Import duplicate blob with no
+//! inner wrapping key. The vTPM consumes this format at first boot;
+//! the encrypted-serial KBKDF then runs over the same VMGS-stored
+//! bytes, so both consumers see identical key material.
+//!
+//! For unit testing without a real TPM blob generator, see the
+//! 422-byte `GUEST_SECRET_KEY_BLOB` fixture in
+//! `vm/devices/tpm/tpm_lib/src/lib.rs::tests`.
 
 use anyhow::Context;
 use anyhow::bail;
@@ -24,6 +30,7 @@ use disk_vhd1::Vhd1Disk;
 use openhcl_attestation_protocol::vmgs::GUEST_SECRET_KEY_MAX_SIZE;
 use openhcl_attestation_protocol::vmgs::GuestSecretKey;
 use std::path::Path;
+use tpm_protocol::tpm20proto::protocol::ImportCmd;
 use vmgs::Vmgs;
 use vmgs_format::FileId;
 use zerocopy::IntoBytes;
@@ -31,13 +38,11 @@ use zerocopy::IntoBytes;
 /// Source of the GSK material to write.
 #[derive(Debug, Clone)]
 pub enum ProvisionSource {
-    /// Generate `GUEST_SECRET_KEY_MAX_SIZE` bytes of random material
-    /// using the OS RNG.
-    Random,
-    /// Read up to `GUEST_SECRET_KEY_MAX_SIZE` bytes verbatim from a
-    /// file. Shorter inputs are zero-padded; longer inputs are an
-    /// error.
-    FromKey(std::path::PathBuf),
+    /// Read up to `GUEST_SECRET_KEY_MAX_SIZE` bytes from a file
+    /// containing a TPM2_Import duplicate blob (no inner wrapping
+    /// key). The file is validated by `ImportCmd::
+    /// deserialize_no_wrapping_key` before being written.
+    FromBlob(std::path::PathBuf),
 }
 
 /// Open `vmgs_path` as a plaintext VHD-formatted VMGS, write GSK
@@ -108,25 +113,43 @@ pub(crate) fn build_payload(
 ) -> anyhow::Result<[u8; GUEST_SECRET_KEY_MAX_SIZE]> {
     let mut buf = [0u8; GUEST_SECRET_KEY_MAX_SIZE];
     match source {
-        ProvisionSource::Random => {
-            getrandom::fill(&mut buf)
-                .map_err(|e| anyhow::anyhow!("generating random GSK material: {e}"))?;
-        }
-        ProvisionSource::FromKey(p) => {
-            let bytes = fs_err::read(p).context("reading --from-key file")?;
+        ProvisionSource::FromBlob(p) => {
+            let bytes = fs_err::read(p).context("reading --from-blob file")?;
             if bytes.is_empty() {
-                bail!("--from-key file is empty");
+                bail!("--from-blob file is empty");
             }
             if bytes.len() > GUEST_SECRET_KEY_MAX_SIZE {
                 bail!(
-                    "--from-key file is {} bytes long; the GuestSecretKey is at most {GUEST_SECRET_KEY_MAX_SIZE} bytes",
+                    "--from-blob file is {} bytes long; the GuestSecretKey slot is at most {GUEST_SECRET_KEY_MAX_SIZE} bytes",
                     bytes.len()
                 );
             }
+            // Validate up front using the same parser the vTPM uses
+            // at first boot, so a bad blob fails here rather than
+            // breaking TPM provisioning later.
+            validate_importable_blob(&bytes).context("validating --from-blob")?;
             buf[..bytes.len()].copy_from_slice(&bytes);
         }
     }
     Ok(buf)
+}
+
+/// Verify that `bytes` parses as a TPM2_Import duplicate blob with
+/// no inner wrapping key. Mirrors the consumer-side parse done by
+/// `tpm_lib::TpmEngineHelper::initialize_guest_secret_key`.
+pub(crate) fn validate_importable_blob(bytes: &[u8]) -> anyhow::Result<()> {
+    // The consumer pads short slots with zeros to
+    // `GUEST_SECRET_KEY_MAX_SIZE` before parsing; mirror that here so
+    // we accept the same shapes the vTPM will.
+    let mut padded = vec![0u8; GUEST_SECRET_KEY_MAX_SIZE];
+    padded[..bytes.len()].copy_from_slice(bytes);
+    if ImportCmd::deserialize_no_wrapping_key(&padded).is_none() {
+        bail!(
+            "blob is not a valid TPM2_Import duplicate (no-inner-wrapping-key) structure; \
+             expected concatenated TPM2B_PUBLIC || TPM2B_PRIVATE || TPM2B_ENCRYPTED_SECRET"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,6 +164,10 @@ mod tests {
     use openhcl_serial_console_crypto::crypto::encrypt;
     use pal_async::async_test;
     use zerocopy::FromBytes;
+
+    /// A known-good 422-byte TPM2_Import duplicate blob (no inner
+    /// wrapping key). See `test_data/README.md`.
+    const VALID_BLOB: &[u8] = include_bytes!("../test_data/tpm_import_blob.bin");
 
     /// Format a fresh ram-backed VMGS and return the disk.
     async fn fresh_vmgs() -> Disk {
@@ -158,16 +185,79 @@ mod tests {
         GksKeyMaterial(payload.guest_secret_key)
     }
 
+    fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), bytes).unwrap();
+        f
+    }
+
+    #[test]
+    fn validate_accepts_known_good_blob() {
+        validate_importable_blob(VALID_BLOB).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_random_bytes() {
+        // 422 random-looking bytes should fail to parse as a
+        // TPM2_Import structure.
+        let bogus: Vec<u8> = (0..422u32).map(|i| (i & 0xff) as u8).collect();
+        let err = validate_importable_blob(&bogus).unwrap_err();
+        assert!(
+            err.to_string().contains("TPM2_Import"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn build_payload_from_blob_pads_to_max() {
+        let f = write_temp(VALID_BLOB);
+        let payload = build_payload(&ProvisionSource::FromBlob(f.path().to_path_buf())).unwrap();
+        assert_eq!(&payload[..VALID_BLOB.len()], VALID_BLOB);
+        assert!(
+            payload[VALID_BLOB.len()..].iter().all(|b| *b == 0),
+            "expected trailing zero padding"
+        );
+    }
+
+    #[test]
+    fn build_payload_rejects_empty_blob_file() {
+        let f = write_temp(b"");
+        let err = build_payload(&ProvisionSource::FromBlob(f.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected: {err:#}");
+    }
+
+    #[test]
+    fn build_payload_rejects_oversized_blob_file() {
+        let f = write_temp(&vec![0u8; GUEST_SECRET_KEY_MAX_SIZE + 1]);
+        let err = build_payload(&ProvisionSource::FromBlob(f.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("at most"), "unexpected: {err:#}");
+    }
+
+    #[test]
+    fn build_payload_rejects_bogus_blob_file() {
+        let f = write_temp(&[0xAAu8; 64]);
+        let err = build_payload(&ProvisionSource::FromBlob(f.path().to_path_buf())).unwrap_err();
+        assert!(
+            err.to_string().contains("validating --from-blob"),
+            "unexpected: {err:#}"
+        );
+    }
+
     #[async_test]
-    async fn provision_random_then_round_trip() {
+    async fn provision_from_blob_then_round_trip() {
         let disk = fresh_vmgs().await;
-        let payload = build_payload(&ProvisionSource::Random).unwrap();
+        let f = write_temp(VALID_BLOB);
+        let payload = build_payload(&ProvisionSource::FromBlob(f.path().to_path_buf())).unwrap();
         provision_on_disk(disk.clone(), &payload, false)
             .await
             .unwrap();
 
         let gks = read_back(disk).await;
         assert_eq!(gks.0, payload, "round-trip mismatch");
+
+        // The same VMGS bytes should serve both consumers: vTPM
+        // (via ImportCmd) and encrypted serial (via KBKDF).
+        validate_importable_blob(&gks.0[..VALID_BLOB.len()]).unwrap();
 
         // Encrypt/decrypt round-trip with the derived key.
         let session_id = [7u8; SESSION_ID_LEN];
@@ -180,37 +270,10 @@ mod tests {
     }
 
     #[async_test]
-    async fn build_payload_from_key_pads_short_input() {
-        let key_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(key_file.path(), [0x42u8; 32]).unwrap();
-        let payload =
-            build_payload(&ProvisionSource::FromKey(key_file.path().to_path_buf())).unwrap();
-        assert_eq!(&payload[..32], &[0x42u8; 32]);
-        assert!(payload[32..].iter().all(|b| *b == 0));
-    }
-
-    #[async_test]
-    async fn build_payload_rejects_empty_key_file() {
-        let key_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(key_file.path(), b"").unwrap();
-        let err =
-            build_payload(&ProvisionSource::FromKey(key_file.path().to_path_buf())).unwrap_err();
-        assert!(err.to_string().contains("empty"), "unexpected: {err:#}");
-    }
-
-    #[async_test]
-    async fn build_payload_rejects_oversized_key_file() {
-        let key_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(key_file.path(), [0u8; GUEST_SECRET_KEY_MAX_SIZE + 1]).unwrap();
-        let err =
-            build_payload(&ProvisionSource::FromKey(key_file.path().to_path_buf())).unwrap_err();
-        assert!(err.to_string().contains("at most"), "unexpected: {err:#}");
-    }
-
-    #[async_test]
     async fn provision_refuses_overwrite_without_force() {
         let disk = fresh_vmgs().await;
-        let payload = [0x33u8; GUEST_SECRET_KEY_MAX_SIZE];
+        let mut payload = [0u8; GUEST_SECRET_KEY_MAX_SIZE];
+        payload[..VALID_BLOB.len()].copy_from_slice(VALID_BLOB);
         provision_on_disk(disk.clone(), &payload, false)
             .await
             .unwrap();
@@ -221,13 +284,19 @@ mod tests {
     #[async_test]
     async fn provision_force_overwrites() {
         let disk = fresh_vmgs().await;
-        let p1 = [0x11u8; GUEST_SECRET_KEY_MAX_SIZE];
-        let mut p2 = [0u8; GUEST_SECRET_KEY_MAX_SIZE];
-        p2[..16].copy_from_slice(&[0x22u8; 16]);
+        let mut p1 = [0u8; GUEST_SECRET_KEY_MAX_SIZE];
+        p1[..VALID_BLOB.len()].copy_from_slice(VALID_BLOB);
+        // Second payload: same valid blob with the high byte of the
+        // first field flipped is invalid TPM, but provisioning
+        // (writing) accepts arbitrary bytes; only `build_payload`
+        // validates. Use the same valid blob with a sentinel suffix
+        // to verify overwrite happens.
+        let mut p2 = p1;
+        p2[VALID_BLOB.len()] = 0xCC;
         provision_on_disk(disk.clone(), &p1, false).await.unwrap();
         provision_on_disk(disk.clone(), &p2, true).await.unwrap();
 
         let gks = read_back(disk).await;
-        assert_eq!(&gks.0[..16], &[0x22u8; 16]);
+        assert_eq!(gks.0[VALID_BLOB.len()], 0xCC);
     }
 }

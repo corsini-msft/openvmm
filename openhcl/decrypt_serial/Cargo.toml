@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
+tpm_protocol.workspace = true
 
 disk_backend.workspace = true
 disk_vhd1.workspace = true

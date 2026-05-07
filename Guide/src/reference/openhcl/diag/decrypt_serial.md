@@ -152,22 +152,29 @@ PoC where you want OpenHCL VTL2 itself (not just the `encrypt_fixture`
 helper) to emit encrypted serial, you can seed `FileId::GUEST_SECRET_KEY`
 in a plaintext development VMGS with the `provision-gsk` subcommand.
 
-> ⚠ This is a **developer-only** path. It writes raw bytes into the
-> GSK slot and does **not** produce a TPM2_Import-shaped duplicate
-> blob. The vTPM first-boot import will fail against a VMGS provisioned
-> this way, so use it only for VMs that don't exercise vTPM
-> provisioning. Encrypted VMGS files are rejected up front.
+> ⚠ This is a **developer-only** path. The same VMGS slot is consumed
+> by the vTPM at first boot, so the bytes written must form a valid
+> TPM2_Import duplicate blob (no inner wrapping key) — the same
+> structure that `tpm_lib::TpmEngineHelper::initialize_guest_secret_key`
+> parses. The tool validates the blob up front using the same parser
+> the vTPM uses, so a malformed file fails here rather than breaking
+> first-boot. Encrypted VMGS files are rejected.
 
 ```sh
-# Generate fresh random GSK material directly into the VMGS.
-decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-random
-
-# Or, write specific bytes (≤ 2048; zero-padded if shorter).
-decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-key gks.bin
+# Provision a TPM2_Import-shaped blob into the VMGS.
+decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-blob importable.bin
 
 # Overwriting an existing slot requires --force.
-decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-random --force
+decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-blob importable.bin --force
 ```
+
+Producing the importable blob itself is out of scope for this tool.
+For a known-good test fixture, see `openhcl/decrypt_serial/test_data/
+tpm_import_blob.bin` (a 422-byte mirror of the
+`GUEST_SECRET_KEY_BLOB` constant in
+`vm/devices/tpm/tpm_lib/src/lib.rs`). For real provisioning, generate
+a duplicate blob using `tpm2-tools`, OpenSSL+marshalling, or
+equivalent CPS tooling.
 
 Once provisioned, the same `--vmgs` file can be passed back to
 `decrypt-serial decrypt` (or the streaming subcommands) so the host-side

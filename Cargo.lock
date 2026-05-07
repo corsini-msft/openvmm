@@ -1171,6 +1171,7 @@ dependencies = [
  "openhcl_serial_console_crypto",
  "pal_async",
  "tempfile",
+ "tpm_protocol",
  "tracing",
  "tracing-subscriber",
  "vmgs",

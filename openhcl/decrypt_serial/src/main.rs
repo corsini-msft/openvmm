@@ -72,7 +72,7 @@ struct DecryptArgs {
 
 #[derive(clap::Args, Debug)]
 #[command(
-    group = ArgGroup::new("provision_source").required(true).args(["from_random", "from_key"]),
+    group = ArgGroup::new("provision_source").required(true).args(["from_blob"]),
 )]
 struct ProvisionGskArgs {
     /// Plaintext VMGS file to provision. Must be opened read-write
@@ -80,13 +80,11 @@ struct ProvisionGskArgs {
     #[arg(short, long, value_name = "PATH")]
     vmgs: std::path::PathBuf,
 
-    /// Generate fresh random GSK material via the OS RNG.
-    #[arg(long, conflicts_with = "from_key")]
-    from_random: bool,
-
-    /// Read GSK material from a file (≤ 2048 bytes, zero-padded).
-    #[arg(long, value_name = "PATH", conflicts_with = "from_random")]
-    from_key: Option<std::path::PathBuf>,
+    /// Read a TPM2_Import duplicate blob (no inner wrapping key)
+    /// from a file. Validated against the same parser the vTPM
+    /// uses at first boot before being written.
+    #[arg(long, value_name = "PATH")]
+    from_blob: Option<std::path::PathBuf>,
 
     /// Overwrite an existing FileId::GUEST_SECRET_KEY entry.
     #[arg(long)]
@@ -126,12 +124,10 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_provision_gsk(args: &ProvisionGskArgs) -> std::process::ExitCode {
-    let source = if args.from_random {
-        provision::ProvisionSource::Random
-    } else if let Some(p) = args.from_key.as_ref() {
-        provision::ProvisionSource::FromKey(p.clone())
+    let source = if let Some(p) = args.from_blob.as_ref() {
+        provision::ProvisionSource::FromBlob(p.clone())
     } else {
-        unreachable!("clap ArgGroup ensures exactly one of --from-random or --from-key is set")
+        unreachable!("clap ArgGroup ensures --from-blob is set")
     };
     let result = pal_async::DefaultPool::run_with(async |_| {
         provision::provision(&args.vmgs, source, args.force).await
