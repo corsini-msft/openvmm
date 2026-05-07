@@ -164,9 +164,19 @@ impl EncryptingSerialIo {
     }
 
     /// Encrypt any pending plaintext into output records. Splits on
-    /// newlines so each line becomes one record. Any remaining bytes
-    /// after the last newline stay in the buffer (flushed later by
-    /// `poll_flush` or when a newline arrives).
+    /// `\n` **or** `\r` so each line — including in-place status
+    /// updates that end in `\r` (no `\n`) — becomes its own record.
+    /// Any bytes after the last line terminator stay in the buffer
+    /// (flushed later by `poll_flush` or when another terminator
+    /// arrives).
+    ///
+    /// Flushing on `\r` is important because `Serial16550::poll_tx`
+    /// only ever calls `poll_write` on its backend — it never calls
+    /// `poll_flush`. Without a `\r` boundary, status messages from
+    /// systemd (which end in `\r` to enable in-place overwrite by a
+    /// subsequent `[ OK ]` completion) would sit in the buffer until
+    /// some unrelated `\n`-terminated write arrives, which disrupts
+    /// the receiver-side `\r` overlay timing.
     fn flush_plaintext_to_output(&mut self) -> Result<(), io::Error> {
         self.flush_plaintext_to_output_inner(false)
     }
@@ -182,10 +192,14 @@ impl EncryptingSerialIo {
                 break;
             }
 
-            // Find the next newline to split on.
-            let chunk = if let Some(nl_pos) = self.plaintext_buf.iter().position(|&b| b == b'\n') {
-                // Include the newline in the record.
-                let chunk: Vec<u8> = self.plaintext_buf.drain(..=nl_pos).collect();
+            // Find the next line terminator (`\n` or `\r`) to split on.
+            let chunk = if let Some(boundary) = self
+                .plaintext_buf
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+            {
+                // Include the terminator byte in the record.
+                let chunk: Vec<u8> = self.plaintext_buf.drain(..=boundary).collect();
                 chunk
             } else if self.plaintext_buf.len() >= MAX_PLAINTEXT_LEN {
                 // Buffer overflow — flush a max-size chunk.
@@ -196,7 +210,7 @@ impl EncryptingSerialIo {
                 let chunk: Vec<u8> = self.plaintext_buf.drain(..).collect();
                 chunk
             } else {
-                // No newline yet and buffer not full — wait for more data.
+                // No terminator yet and buffer not full — wait for more data.
                 break;
             };
 
@@ -301,10 +315,12 @@ impl AsyncWrite for EncryptingSerialIo {
         let accepted = buf.len();
         self.plaintext_buf.extend_from_slice(buf);
 
-        // Encrypt when we see a newline (line-buffered), which
-        // batches typical serial output into one record per line
-        // instead of one record per byte.
-        if self.plaintext_buf.contains(&b'\n') {
+        // Encrypt when we see a line terminator (`\n` or `\r`),
+        // which batches typical serial output into one record per
+        // line instead of one record per byte. Both terminators are
+        // line breaks on real terminals — `\r` is used by systemd
+        // for in-place status updates that expect to be overwritten.
+        if self.plaintext_buf.iter().any(|&b| b == b'\n' || b == b'\r') {
             self.flush_plaintext_to_output()?;
             // Try to start draining right away.
             let _ = self.poll_drain_output(cx);
