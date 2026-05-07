@@ -204,6 +204,18 @@ pub fn init_tracing(spawn: impl Spawn, tracer: RemoteTracer) -> anyhow::Result<(
     let json_fmt_layer = json_layer::JsonMeshLayer::new(tracer.trace_writer);
 
     // Output nicely readable events to kmsg (and therefore also serial).
+    // TODO(encrypted-serial-poc): Stub key for development. Replace
+    // with real GSK before production.
+    let kmsg_writer = {
+        let inner = kmsg_writer::KmsgWriter::new(kmsg_defs::UNDERHILL_KMSG_FACILITY)?;
+        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        let gks = openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf);
+        crate::emuplat::encrypted_kmsg::EncryptingKmsgWriter::new(inner, &gks)
+            .context("failed to create encrypting kmsg writer")?
+    };
     let kmsg_layer = tracing_subscriber::fmt::layer()
         .event_format(
             Format::default()
@@ -214,9 +226,7 @@ pub fn init_tracing(spawn: impl Spawn, tracer: RemoteTracer) -> anyhow::Result<(
         .fmt_fields(FieldFormatter)
         .log_internal_errors(true)
         .with_span_events(span_events)
-        .with_writer(kmsg_writer::KmsgWriter::new(
-            kmsg_defs::UNDERHILL_KMSG_FACILITY,
-        )?);
+        .with_writer(kmsg_writer);
 
     // Filter out events that aren't allowed for CVMs, when filtering is enabled.
     let cvm_filter = underhill_confidentiality::confidential_filtering_enabled()
