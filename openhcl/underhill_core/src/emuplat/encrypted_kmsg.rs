@@ -50,7 +50,7 @@ struct EncryptState {
 impl EncryptingKmsgWriter {
     /// Create a new encrypting kmsg writer.
     ///
-    /// Derives a per-session AES key from the provided GKS material.
+    /// Derives a per-session AES key from the provided GSK material.
     pub fn new(inner: kmsg_writer::KmsgWriter, gks: &GksKeyMaterial) -> std::io::Result<Self> {
         let mut session_id = [0u8; SESSION_ID_LEN];
         getrandom::fill(&mut session_id)

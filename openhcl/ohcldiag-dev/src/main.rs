@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod completions;
+mod kmsg_decrypt;
 
 use anyhow::Context;
 use clap::ArgGroup;
@@ -145,6 +146,9 @@ enum Command {
         /// Write verbose information about the connection state.
         #[clap(short, long)]
         verbose: bool,
+        /// Decrypt encrypted serial sentinels using the provided key file.
+        #[clap(long, value_name = "PATH")]
+        decrypt_key: Option<std::path::PathBuf>,
         /// Read kmsg from the VM's serial port.
         ///
         /// This only works on Hyper-V.
@@ -643,12 +647,20 @@ pub fn main() -> anyhow::Result<()> {
                 follow,
                 reconnect,
                 verbose,
+                decrypt_key,
                 #[cfg(windows)]
                 serial,
                 #[cfg(windows)]
                 pipe_path,
             } => {
                 let is_terminal = std::io::stdout().is_terminal();
+
+                // Set up decryptor if a key file was provided.
+                let decryptor = if let Some(key_path) = &decrypt_key {
+                    Some(kmsg_decrypt::KmsgDecryptor::new(key_path)?)
+                } else {
+                    None
+                };
 
                 #[cfg(windows)]
                 if serial {
@@ -676,7 +688,14 @@ pub fn main() -> anyhow::Result<()> {
                     while let Some(line) = lines.next().await {
                         let line = line?;
                         if let Some(message) = kmsg::SyslogParsedEntry::new(&line) {
-                            println!("{}", message.display(is_terminal));
+                            let displayed = format!("{}", message.display(is_terminal));
+                            if let Some(dec) = &decryptor {
+                                println!("{}", dec.decrypt_line(&displayed));
+                            } else {
+                                println!("{displayed}");
+                            }
+                        } else if let Some(dec) = &decryptor {
+                            println!("{}", dec.decrypt_line(&line));
                         } else {
                             println!("{line}");
                         }
@@ -702,7 +721,14 @@ pub fn main() -> anyhow::Result<()> {
                     while let Some(data) = file_stream.next().await {
                         match data {
                             Ok(data) => match kmsg::KmsgParsedEntry::new(&data) {
-                                Ok(message) => println!("{}", message.display(is_terminal)),
+                                Ok(message) => {
+                                    let displayed = format!("{}", message.display(is_terminal));
+                                    if let Some(dec) = &decryptor {
+                                        println!("{}", dec.decrypt_line(&displayed));
+                                    } else {
+                                        println!("{displayed}");
+                                    }
+                                }
                                 Err(e) => println!("Invalid kmsg entry: {e:?}"),
                             },
                             Err(err) if reconnect && err.kind() == ErrorKind::ConnectionReset => {
