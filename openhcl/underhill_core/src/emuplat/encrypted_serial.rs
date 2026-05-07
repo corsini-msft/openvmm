@@ -163,34 +163,72 @@ impl EncryptingSerialIo {
         }
     }
 
-    /// Encrypt any pending plaintext into output records.
+    /// Encrypt any pending plaintext into output records. Splits on
+    /// newlines so each line becomes one record. Any remaining bytes
+    /// after the last newline stay in the buffer (flushed later by
+    /// `poll_flush` or when a newline arrives).
     fn flush_plaintext_to_output(&mut self) -> Result<(), io::Error> {
-        while !self.plaintext_buf.is_empty() {
-            let chunk_len = self.plaintext_buf.len().min(MAX_PLAINTEXT_LEN);
-            let chunk: Vec<u8> = self.plaintext_buf.drain(..chunk_len).collect();
+        self.flush_plaintext_to_output_inner(false)
+    }
 
-            let mut nonce = [0u8; NONCE_LEN];
-            getrandom::fill(&mut nonce)
-                .map_err(|e| io::Error::other(format!("nonce generation failed: {e}")))?;
+    /// Flush all plaintext, including any partial line at the end.
+    fn flush_all_plaintext_to_output(&mut self) -> Result<(), io::Error> {
+        self.flush_plaintext_to_output_inner(true)
+    }
 
-            let (ciphertext, tag) =
-                encrypt(&self.aes_key, &self.session_id, self.seq, &nonce, &chunk)
-                    .map_err(|e| io::Error::other(format!("encryption failed: {e}")))?;
+    fn flush_plaintext_to_output_inner(&mut self, flush_partial: bool) -> Result<(), io::Error> {
+        loop {
+            if self.plaintext_buf.is_empty() {
+                break;
+            }
 
-            let record = Record {
-                session_id: self.session_id,
-                seq: self.seq,
-                nonce,
-                ciphertext,
-                tag,
+            // Find the next newline to split on.
+            let chunk = if let Some(nl_pos) = self.plaintext_buf.iter().position(|&b| b == b'\n') {
+                // Include the newline in the record.
+                let chunk: Vec<u8> = self.plaintext_buf.drain(..=nl_pos).collect();
+                chunk
+            } else if self.plaintext_buf.len() >= MAX_PLAINTEXT_LEN {
+                // Buffer overflow — flush a max-size chunk.
+                let chunk: Vec<u8> = self.plaintext_buf.drain(..MAX_PLAINTEXT_LEN).collect();
+                chunk
+            } else if flush_partial {
+                // Flush whatever remains (called from poll_flush).
+                let chunk: Vec<u8> = self.plaintext_buf.drain(..).collect();
+                chunk
+            } else {
+                // No newline yet and buffer not full — wait for more data.
+                break;
             };
 
-            let sentinel = record.encode_to_string();
-            self.output_buf.extend(sentinel.as_bytes());
-            self.output_buf.push_back(b'\n');
-
-            self.seq += 1;
+            self.encrypt_and_enqueue(&chunk)?;
         }
+        Ok(())
+    }
+
+    /// Encrypt a single chunk and append the sentinel record to the
+    /// output buffer.
+    fn encrypt_and_enqueue(&mut self, plaintext: &[u8]) -> Result<(), io::Error> {
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| io::Error::other(format!("nonce generation failed: {e}")))?;
+
+        let (ciphertext, tag) =
+            encrypt(&self.aes_key, &self.session_id, self.seq, &nonce, plaintext)
+                .map_err(|e| io::Error::other(format!("encryption failed: {e}")))?;
+
+        let record = Record {
+            session_id: self.session_id,
+            seq: self.seq,
+            nonce,
+            ciphertext,
+            tag,
+        };
+
+        let sentinel = record.encode_to_string();
+        self.output_buf.extend(sentinel.as_bytes());
+        self.output_buf.push_back(b'\n');
+
+        self.seq += 1;
         Ok(())
     }
 
@@ -263,18 +301,21 @@ impl AsyncWrite for EncryptingSerialIo {
         let accepted = buf.len();
         self.plaintext_buf.extend_from_slice(buf);
 
-        // Encrypt immediately so records are ready for the next drain.
-        self.flush_plaintext_to_output()?;
-
-        // Try to start draining right away.
-        let _ = self.poll_drain_output(cx);
+        // Encrypt when we see a newline (line-buffered), which
+        // batches typical serial output into one record per line
+        // instead of one record per byte.
+        if self.plaintext_buf.contains(&b'\n') {
+            self.flush_plaintext_to_output()?;
+            // Try to start draining right away.
+            let _ = self.poll_drain_output(cx);
+        }
 
         Poll::Ready(Ok(accepted))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Encrypt any remaining plaintext.
-        self.flush_plaintext_to_output()?;
+        // Encrypt any remaining plaintext, including partial lines.
+        self.flush_all_plaintext_to_output()?;
 
         // Drain all encrypted output.
         match self.poll_drain_output(cx) {
