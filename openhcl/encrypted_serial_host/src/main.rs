@@ -122,6 +122,14 @@ struct BridgeArgs {
     #[arg(long, value_name = "PATH")]
     pipe: std::path::PathBuf,
 
+    /// Wait for the named pipe to become available rather than
+    /// failing fast. Useful when the pipe is created by something
+    /// else (e.g. Hyper-V starting the VM) and you want to launch
+    /// the bridge before that has happened. Retries every 500ms
+    /// forever; press Ctrl+C to abort.
+    #[arg(long)]
+    wait: bool,
+
     /// Increase log verbosity. Same semantics as on
     /// `decrypt-stream` / `encrypt-stream`.
     #[arg(long, action = clap::ArgAction::Count)]
@@ -278,7 +286,7 @@ fn run_encrypt_stream(args: &StreamKeyArgs) -> std::process::ExitCode {
 }
 
 fn run_bridge(args: &BridgeArgs) -> std::process::ExitCode {
-    match bridge::bridge(&args.key, &args.vmgs, &args.pipe) {
+    match bridge::bridge(&args.key, &args.vmgs, &args.pipe, args.wait) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("encrypted-serial bridge: {err:#}");

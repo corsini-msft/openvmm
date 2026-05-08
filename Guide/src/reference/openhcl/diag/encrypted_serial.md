@@ -128,6 +128,16 @@ Hyper-V serial named pipe) and runs both directions over it:
 encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3'
 ```
 
+If the pipe doesn't exist yet (e.g. you launched `bridge` before
+starting the VM), pass `--wait` to retry every 500 ms forever
+until it's available — Ctrl+C aborts:
+
+```sh
+# Order-independent: works whether you start the VM before or
+# after the bridge.
+encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3' --wait
+```
+
 Behind the scenes the binary spawns two threads:
 
 - **decrypt thread:** reads encrypted records from the pipe,
