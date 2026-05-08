@@ -4,20 +4,29 @@
 //! Bidirectional bridge between a Hyper-V serial pipe (or any
 //! bidirectional file-like transport) and the user's terminal.
 //!
-//! Spawns two threads: one decrypts records arriving from the pipe
-//! into stdout, the other encrypts user input from stdin into
-//! records on the pipe. Each direction runs its own AES-256-GCM
-//! session — both keyed off the shared GKS but with distinct
-//! `session_id`s, so the two streams sharing one wire transport
-//! cannot collide on AES-GCM nonces.
+//! The pipe handle is wrapped in `pal_async::pipe::PolledPipe`, which
+//! uses Windows' `FSCTL_PIPE_EVENT_SELECT` to provide non-blocking,
+//! event-driven reads and writes on a single underlying handle. This
+//! sidesteps the previous architecture's bug: opening one synchronous
+//! pipe handle and using `try_clone()` to give the read and write
+//! threads their own handles produced two handles to the **same kernel
+//! File Object**, and the kernel serializes synchronous I/O at the
+//! File Object level. As soon as the recv direction entered a blocking
+//! `ReadFile` waiting for VM output, every subsequent `WriteFile` from
+//! the send direction queued behind it. Symptom: first keystroke
+//! reaches the VM, every subsequent one hangs until the pipe closes.
+//! `PolledPipe` avoids the issue because all I/O on it is non-blocking
+//! at the OS level and serialized only by our async runtime.
 //!
-//! Threading instead of `pal_async` here is deliberate: stdin reads
-//! are inherently blocking and cancelling them across platforms is
-//! awkward. When the pipe closes (decrypt thread sees EOF) the
-//! caller process exits, which is enough to tear down the still-
-//! blocked stdin reader.
+//! Stdin reads still happen on a dedicated synchronous OS thread,
+//! since neither std nor pal_async offer asynchronous stdin on
+//! Windows. The thread forwards typed bytes to the async send task
+//! over a `futures::channel::mpsc` channel.
 
 use anyhow::Context;
+use futures::AsyncReadExt;
+use futures::AsyncWriteExt;
+use futures::StreamExt;
 use openhcl_serial_console_crypto::consts::MAX_PLAINTEXT_LEN;
 use openhcl_serial_console_crypto::consts::NONCE_LEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
@@ -26,12 +35,13 @@ use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
 use openhcl_serial_console_crypto::stream::StreamScanner;
+use pal_async::DefaultPool;
+use pal_async::pipe::PolledPipe;
+use pal_async::task::Spawn;
 use std::fs::OpenOptions;
-use std::io::BufRead;
-use std::io::BufReader;
+use std::io::IsTerminal;
 use std::io::Read;
 use std::io::Write;
-use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,74 +92,58 @@ pub fn bridge(
         "bridge started",
     );
 
-    // Open the pipe twice. On Windows a named pipe opened with
-    // GENERIC_READ | GENERIC_WRITE is bidirectional and
-    // `File::try_clone()` returns a separate handle; on Unix the
-    // same trick works for FIFOs and sockets.
-    let pipe_for_decrypt = open_pipe_waiting(pipe_path, wait)
-        .with_context(|| format!("opening pipe for decrypt direction: {pipe_path:?}"))?;
-    let pipe_for_encrypt = pipe_for_decrypt
-        .try_clone()
-        .context("cloning pipe handle for encrypt direction")?;
+    DefaultPool::run_with(async move |driver| -> anyhow::Result<()> {
+        let pipe = open_pipe_waiting(pipe_path, wait)
+            .with_context(|| format!("opening pipe: {pipe_path:?}"))?;
+        let polled =
+            PolledPipe::new(&driver, pipe).context("wrapping pipe for async I/O")?;
+        let (pipe_reader, pipe_writer) = polled.split();
 
-    // Enable raw stdin mode if we're on a Windows console, so each
-    // keystroke is forwarded immediately rather than waiting for a
-    // newline. The guard restores the console mode on drop, even
-    // if the bridge errors out partway through. On non-Windows or
-    // when stdin isn't a TTY (piped input, tests), this is a no-op.
-    let _raw_guard = enable_raw_input_if_tty()?;
+        let _raw_guard = enable_raw_input_if_tty()?;
 
-    let gks_decrypt = gks.clone();
-    let decrypt_thread = thread::Builder::new()
-        .name("encrypted-serial-bridge-decrypt".into())
-        .spawn(move || -> anyhow::Result<()> {
-            let mut reader = BufReader::new(pipe_for_decrypt);
-            let stdout = std::io::stdout();
-            let mut writer = stdout.lock();
-            decrypt_loop(&gks_decrypt, &mut reader, &mut writer)
-        })
-        .context("spawning decrypt thread")?;
+        // Sync stdin → channel → async encrypt task. See module
+        // doc on why stdin stays on its own OS thread.
+        let (stdin_tx, stdin_rx) = mesh::channel::<Vec<u8>>();
+        let _stdin_thread = thread::Builder::new()
+            .name("encrypted-serial-bridge-stdin".into())
+            .spawn(move || stdin_reader_loop(stdin_tx))
+            .context("spawning stdin reader thread")?;
 
-    let gks_encrypt = gks.clone();
-    let encrypt_thread = thread::Builder::new()
-        .name("encrypted-serial-bridge-encrypt".into())
-        .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let mut reader = open_keystroke_source()?;
-                encrypt_loop(&gks_encrypt, reader.as_mut(), pipe_for_encrypt)
-            })();
-            // Log the thread's exit reason so a silent failure (which
-            // would otherwise look like a frozen bridge with keystrokes
-            // queueing in the OS console buffer until the process
-            // exits) is observable.
+        let gks_decrypt = gks.clone();
+        let decrypt_task = driver.spawn("bridge-decrypt", async move {
+            decrypt_loop(&gks_decrypt, pipe_reader).await
+        });
+
+        let gks_encrypt = gks.clone();
+        let encrypt_task = driver.spawn("bridge-encrypt", async move {
+            let result = encrypt_loop(&gks_encrypt, stdin_rx, pipe_writer).await;
             match &result {
-                Ok(()) => info!("bridge: encrypt thread exited cleanly (stdin EOF)"),
-                Err(e) => warn!(error = ?e, "bridge: encrypt thread exited with error"),
+                Ok(()) => info!("bridge: encrypt task exited cleanly (stdin EOF)"),
+                Err(e) => warn!(error = ?e, "bridge: encrypt task exited with error"),
             }
             result
-        })
-        .context("spawning encrypt thread")?;
+        });
 
-    // Wait for the decrypt direction to end (pipe closed by VTL2,
-    // or read error). When that happens, exit the whole process —
-    // the encrypt thread is most likely blocked on a stdin read
-    // that we have no clean way to cancel cross-platform.
-    let decrypt_result = decrypt_thread.join();
-    info!("bridge: decrypt direction ended, shutting down");
-    match decrypt_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!(error = ?e, "decrypt thread returned error"),
-        Err(_) => warn!("decrypt thread panicked"),
-    }
-    drop(encrypt_thread); // detach; process exit will tear it down
-    // _raw_guard drops here, restoring console mode.
+        // Wait for the decrypt direction to end (pipe closed by
+        // VTL2 or read error). When that happens, exit. Drop the
+        // encrypt task so its receiver goes away — that closes
+        // the channel and lets the stdin thread exit on its next
+        // send (or stays blocked in `read`, in which case the
+        // process exit terminates it).
+        let decrypt_result = decrypt_task.await;
+        info!("bridge: decrypt direction ended, shutting down");
+        if let Err(e) = decrypt_result {
+            warn!(error = ?e, "decrypt task returned error");
+        }
+        drop(encrypt_task);
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// Plain-bridge mode: forward raw bytes both directions, bypassing
-/// encryption and decryption entirely. Same threading + raw-mode +
-/// `\\.\CONIN$` handling as [`bridge`], so the test scenario
-/// matches as closely as possible.
+/// encryption and decryption entirely. Same `PolledPipe` + raw-mode
+/// + `\\.\CONIN$` plumbing as [`bridge`].
 fn bridge_plain(pipe_path: &Path, wait: bool) -> anyhow::Result<()> {
     info!(
         sha = build_info::get().scm_revision(),
@@ -159,75 +153,247 @@ fn bridge_plain(pipe_path: &Path, wait: bool) -> anyhow::Result<()> {
         "bridge started (plain mode: encryption disabled)",
     );
 
-    let pipe_for_recv = open_pipe_waiting(pipe_path, wait)
-        .with_context(|| format!("opening pipe for recv direction: {pipe_path:?}"))?;
-    let pipe_for_send = pipe_for_recv
-        .try_clone()
-        .context("cloning pipe handle for send direction")?;
+    DefaultPool::run_with(async move |driver| -> anyhow::Result<()> {
+        let pipe = open_pipe_waiting(pipe_path, wait)
+            .with_context(|| format!("opening pipe: {pipe_path:?}"))?;
+        let polled =
+            PolledPipe::new(&driver, pipe).context("wrapping pipe for async I/O")?;
+        let (pipe_reader, pipe_writer) = polled.split();
 
-    let _raw_guard = enable_raw_input_if_tty()?;
+        let _raw_guard = enable_raw_input_if_tty()?;
 
-    let recv_thread = thread::Builder::new()
-        .name("encrypted-serial-bridge-plain-recv".into())
-        .spawn(move || -> anyhow::Result<()> {
-            let mut reader = pipe_for_recv;
-            let stdout = std::io::stdout();
-            let mut writer = stdout.lock();
-            plain_copy_loop(&mut reader, &mut writer, "recv")
-        })
-        .context("spawning plain recv thread")?;
+        let (stdin_tx, stdin_rx) = mesh::channel::<Vec<u8>>();
+        let _stdin_thread = thread::Builder::new()
+            .name("encrypted-serial-bridge-plain-stdin".into())
+            .spawn(move || stdin_reader_loop(stdin_tx))
+            .context("spawning stdin reader thread")?;
 
-    let send_thread = thread::Builder::new()
-        .name("encrypted-serial-bridge-plain-send".into())
-        .spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let mut reader = open_keystroke_source()?;
-                let mut writer = pipe_for_send;
-                plain_copy_loop(reader.as_mut(), &mut writer, "send")
-            })();
+        let recv_task = driver.spawn("bridge-plain-recv", async move {
+            plain_recv_loop(pipe_reader).await
+        });
+
+        let send_task = driver.spawn("bridge-plain-send", async move {
+            let result = plain_send_loop(stdin_rx, pipe_writer).await;
             match &result {
-                Ok(()) => info!("bridge plain: send thread exited cleanly (stdin EOF)"),
-                Err(e) => warn!(error = ?e, "bridge plain: send thread exited with error"),
+                Ok(()) => info!("bridge plain: send task exited cleanly (stdin EOF)"),
+                Err(e) => warn!(error = ?e, "bridge plain: send task exited with error"),
             }
             result
-        })
-        .context("spawning plain send thread")?;
+        });
 
-    let recv_result = recv_thread.join();
-    info!("bridge plain: recv direction ended, shutting down");
-    match recv_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!(error = ?e, "plain recv thread returned error"),
-        Err(_) => warn!("plain recv thread panicked"),
-    }
-    drop(send_thread);
+        let recv_result = recv_task.await;
+        info!("bridge plain: recv direction ended, shutting down");
+        if let Err(e) = recv_result {
+            warn!(error = ?e, "bridge plain: recv task returned error");
+        }
+        drop(send_task);
+        Ok(())
+    })?;
     Ok(())
 }
 
-/// Raw byte-copy loop with the same per-call `debug!` instrumentation
-/// the encrypted path uses, so plain-mode logs are directly
-/// comparable.
-fn plain_copy_loop<R: Read + ?Sized, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    direction: &'static str,
-) -> anyhow::Result<()> {
-    let mut buf = [0u8; 4096];
-    let mut total: u64 = 0;
+/// Synchronous stdin reader. Runs in its own OS thread; forwards
+/// bytes to the async send/encrypt task via a `mesh::channel`.
+/// Exits when stdin EOFs. Note: `mesh::Sender::send` is infallible
+/// (it silently drops the message if the receiver is gone), so the
+/// thread can't detect channel closure on its own — process exit
+/// terminates it.
+fn stdin_reader_loop(sender: mesh::Sender<Vec<u8>>) {
+    let result = (|| -> anyhow::Result<()> {
+        let mut reader = open_keystroke_source()?;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            debug!("bridge stdin: about to read");
+            let n = reader.read(&mut buf).context("reading stdin")?;
+            debug!(n, "bridge stdin: read returned");
+            if n == 0 {
+                info!("bridge stdin: EOF");
+                return Ok(());
+            }
+            sender.send(buf[..n].to_vec());
+        }
+    })();
+    if let Err(e) = result {
+        warn!(error = ?e, "bridge stdin: reader thread exited with error");
+    }
+}
+
+/// Async decrypt loop: read encrypted bytes from the pipe, decrypt
+/// (and pass through any non-sentinel bytes), write plaintext to
+/// stdout. Stdout writes stay synchronous — they're fast and don't
+/// block on remote events.
+async fn decrypt_loop<R>(gks: &GksKeyMaterial, mut reader: R) -> anyhow::Result<()>
+where
+    R: futures::AsyncRead + Unpin,
+{
+    let mut scanner = StreamScanner::new();
+    let mut buf = vec![0u8; 4096];
+    let mut total_in: u64 = 0;
+    let mut total_out: u64 = 0;
     loop {
-        debug!(direction, "bridge plain: about to read");
-        let n = reader.read(&mut buf).context("reading")?;
-        debug!(direction, n, "bridge plain: read returned");
+        // Don't hold the StdoutLock across await — it isn't Send,
+        // and pal_async tasks must be Send.
+        let n = reader.read(&mut buf).await.context("reading from pipe")?;
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
         if n == 0 {
-            info!(direction, total, "bridge plain: EOF");
+            let stats = scanner
+                .drain(gks, /* at_eof */ true, &mut writer)
+                .context("draining at EOF")?;
+            total_out += stats.bytes_out;
+            writer.flush().context("flushing stdout")?;
+            info!(
+                total_in,
+                total_out,
+                sessions = scanner.sessions(),
+                "bridge decrypt: pipe EOF",
+            );
             return Ok(());
         }
-        debug!(direction, bytes = n, "bridge plain: about to write");
-        writer.write_all(&buf[..n]).context("writing")?;
-        debug!(direction, bytes = n, "bridge plain: wrote");
-        writer.flush().context("flushing")?;
+        debug!(
+            bytes = n,
+            buf_before = scanner.buffered(),
+            "bridge decrypt: fill_buf",
+        );
+        scanner.extend(&buf[..n]);
+        total_in += n as u64;
+        let stats = scanner
+            .drain(gks, /* at_eof */ false, &mut writer)
+            .context("draining")?;
+        total_out += stats.bytes_out;
+        writer.flush().context("flushing stdout")?;
+    }
+}
+
+/// Async encrypt loop: receive plaintext chunks from the stdin
+/// reader thread via channel, encrypt each into a record, write to
+/// the pipe.
+///
+/// Each channel message becomes one or more records: the message is
+/// split into `MAX_PLAINTEXT_LEN`-sized chunks and each chunk is
+/// encrypted into its own record.
+async fn encrypt_loop<W>(
+    gks: &GksKeyMaterial,
+    mut stdin_rx: mesh::Receiver<Vec<u8>>,
+    mut writer: W,
+) -> anyhow::Result<()>
+where
+    W: futures::AsyncWrite + Unpin,
+{
+    let mut session_id = [0u8; SESSION_ID_LEN];
+    getrandom::fill(&mut session_id)
+        .map_err(|e| anyhow::anyhow!("generating session_id: {e}"))?;
+    let aes_key = derive_aes_key(gks, &session_id).context("deriving AES key")?;
+    let mut seq: u64 = 0;
+    let mut total_in: u64 = 0;
+    let mut total_records: u64 = 0;
+
+    info!(
+        session_id_first8 = ?&session_id[..8],
+        "bridge encrypt: session opened",
+    );
+
+    while let Some(bytes) = stdin_rx.next().await {
+        let n = bytes.len();
+        debug!(n, "bridge encrypt: received from stdin");
+        total_in += n as u64;
+        for chunk in bytes.chunks(MAX_PLAINTEXT_LEN) {
+            let mut nonce = [0u8; NONCE_LEN];
+            getrandom::fill(&mut nonce)
+                .map_err(|e| anyhow::anyhow!("generating nonce: {e}"))?;
+            let (ciphertext, tag) =
+                encrypt(&aes_key, &session_id, seq, &nonce, chunk)
+                    .context("encrypting chunk")?;
+            let record = Record {
+                session_id,
+                seq,
+                nonce,
+                ciphertext,
+                tag,
+            };
+            let encoded = record.encode_to_string();
+            debug!(
+                seq,
+                bytes = encoded.len(),
+                "bridge encrypt: about to write record",
+            );
+            // Wire framing: just the sentinel back-to-back, no
+            // delimiter — matches the in-VM producer's contract.
+            writer
+                .write_all(encoded.as_bytes())
+                .await
+                .context("writing record to pipe")?;
+            debug!(seq, "bridge encrypt: wrote record");
+            seq += 1;
+            total_records += 1;
+        }
+        debug!("bridge encrypt: about to flush");
+        writer.flush().await.context("flushing pipe")?;
+        debug!(
+            bytes_in = n,
+            records_emitted = total_records,
+            "bridge encrypt: read+emitted",
+        );
+    }
+    info!(
+        total_in,
+        total_records,
+        "bridge encrypt: stdin channel closed",
+    );
+    Ok(())
+}
+
+/// Plain recv loop: pipe → stdout, raw bytes. Same instrumentation
+/// shape as the encrypted decrypt loop so plain-mode logs are
+/// directly comparable.
+async fn plain_recv_loop<R>(mut reader: R) -> anyhow::Result<()>
+where
+    R: futures::AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; 4096];
+    let mut total: u64 = 0;
+    loop {
+        debug!(direction = "recv", "bridge plain: about to read");
+        let n = reader
+            .read(&mut buf)
+            .await
+            .context("reading from pipe")?;
+        debug!(direction = "recv", n, "bridge plain: read returned");
+        // Don't hold the StdoutLock across await; lock per chunk.
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        if n == 0 {
+            info!(direction = "recv", total, "bridge plain: pipe EOF");
+            return Ok(());
+        }
+        writer.write_all(&buf[..n]).context("writing stdout")?;
+        writer.flush().context("flushing stdout")?;
         total += n as u64;
     }
+}
+
+/// Plain send loop: stdin channel → pipe, raw bytes.
+async fn plain_send_loop<W>(
+    mut stdin_rx: mesh::Receiver<Vec<u8>>,
+    mut writer: W,
+) -> anyhow::Result<()>
+where
+    W: futures::AsyncWrite + Unpin,
+{
+    let mut total: u64 = 0;
+    while let Some(bytes) = stdin_rx.next().await {
+        let n = bytes.len();
+        debug!(direction = "send", bytes = n, "bridge plain: about to write");
+        writer
+            .write_all(&bytes)
+            .await
+            .context("writing to pipe")?;
+        debug!(direction = "send", bytes = n, "bridge plain: wrote");
+        writer.flush().await.context("flushing pipe")?;
+        total += n as u64;
+    }
+    info!(direction = "send", total, "bridge plain: stdin channel closed");
+    Ok(())
 }
 
 /// Open the byte source for the encrypt direction.
@@ -236,8 +402,7 @@ fn plain_copy_loop<R: Read + ?Sized, W: Write>(
 /// `std::io::Stdin` (which uses `ReadConsoleW` and has its own
 /// buffering quirks in raw mode) and open `\\.\CONIN$` directly.
 /// `File::read` on that handle uses `ReadFile`, which in raw mode
-/// returns each keystroke as it arrives — exactly what the encrypt
-/// loop wants.
+/// returns each keystroke as it arrives.
 ///
 /// On Unix or when stdin isn't a TTY, we just read from stdin
 /// normally.
@@ -324,134 +489,6 @@ fn open_pipe_waiting(path: &Path, wait: bool) -> std::io::Result<std::fs::File> 
                 thread::sleep(Duration::from_millis(500));
             }
         }
-    }
-}
-
-/// Read encrypted records (and any non-sentinel passthrough) from
-/// the pipe, decrypt, write plaintext to stdout. Owns its own
-/// `StreamScanner` (consumer session keys are observed in incoming
-/// records).
-fn decrypt_loop<R: BufRead, W: Write>(
-    gks: &GksKeyMaterial,
-    reader: &mut R,
-    writer: &mut W,
-) -> anyhow::Result<()> {
-    let mut scanner = StreamScanner::new();
-    let mut total_in: u64 = 0;
-    let mut total_out: u64 = 0;
-    loop {
-        let n = {
-            let chunk = reader.fill_buf().context("reading from pipe")?;
-            if chunk.is_empty() {
-                let stats = scanner
-                    .drain(gks, /* at_eof */ true, writer)
-                    .context("draining at EOF")?;
-                total_out += stats.bytes_out;
-                writer.flush().context("flushing stdout")?;
-                info!(
-                    total_in,
-                    total_out,
-                    sessions = scanner.sessions(),
-                    "bridge decrypt: pipe EOF",
-                );
-                return Ok(());
-            }
-            debug!(
-                bytes = chunk.len(),
-                buf_before = scanner.buffered(),
-                "bridge decrypt: fill_buf",
-            );
-            scanner.extend(chunk);
-            chunk.len()
-        };
-        reader.consume(n);
-        total_in += n as u64;
-
-        let stats = scanner
-            .drain(gks, /* at_eof */ false, writer)
-            .context("draining")?;
-        total_out += stats.bytes_out;
-        writer.flush().context("flushing stdout")?;
-    }
-}
-
-/// Read raw bytes from stdin, encrypt each chunk into a single
-/// record, write to the pipe.
-///
-/// One encrypted record per `Read::read` call: when stdin is in
-/// cooked mode (the default for a TTY) each call returns one line,
-/// so each line becomes one record. When stdin is in raw mode each
-/// call returns one keystroke, so each keystroke becomes one
-/// record (higher framing overhead but predictable latency).
-/// Chunks larger than `MAX_PLAINTEXT_LEN` are split across multiple
-/// records.
-fn encrypt_loop<R: Read + ?Sized>(
-    gks: &GksKeyMaterial,
-    reader: &mut R,
-    mut writer: impl Write,
-) -> anyhow::Result<()> {
-    let mut session_id = [0u8; SESSION_ID_LEN];
-    getrandom::fill(&mut session_id)
-        .map_err(|e| anyhow::anyhow!("generating session_id: {e}"))?;
-    let aes_key = derive_aes_key(gks, &session_id).context("deriving AES key")?;
-    let mut seq: u64 = 0;
-    let mut total_in: u64 = 0;
-    let mut total_records: u64 = 0;
-
-    info!(
-        session_id_first8 = ?&session_id[..8],
-        "bridge encrypt: session opened",
-    );
-
-    let mut buf = vec![0u8; MAX_PLAINTEXT_LEN];
-    loop {
-        debug!("bridge encrypt: about to read");
-        let n = reader.read(&mut buf).context("reading stdin")?;
-        debug!(n, "bridge encrypt: read returned");
-        if n == 0 {
-            info!(
-                total_in,
-                total_records,
-                "bridge encrypt: stdin EOF",
-            );
-            return Ok(());
-        }
-        total_in += n as u64;
-        for chunk in buf[..n].chunks(MAX_PLAINTEXT_LEN) {
-            let mut nonce = [0u8; NONCE_LEN];
-            getrandom::fill(&mut nonce)
-                .map_err(|e| anyhow::anyhow!("generating nonce: {e}"))?;
-            let (ciphertext, tag) =
-                encrypt(&aes_key, &session_id, seq, &nonce, chunk)
-                    .context("encrypting chunk")?;
-            let record = Record {
-                session_id,
-                seq,
-                nonce,
-                ciphertext,
-                tag,
-            };
-            let encoded = record.encode_to_string();
-            debug!(
-                seq,
-                bytes = encoded.len(),
-                "bridge encrypt: about to write record",
-            );
-            // Wire framing: just the sentinel back-to-back, no
-            // delimiter — matches the in-VM producer's contract.
-            write!(writer, "{encoded}")
-                .context("writing record to pipe")?;
-            debug!(seq, "bridge encrypt: wrote record");
-            seq += 1;
-            total_records += 1;
-        }
-        debug!("bridge encrypt: about to flush");
-        writer.flush().context("flushing pipe")?;
-        debug!(
-            bytes_in = n,
-            records_emitted = total_records,
-            "bridge encrypt: read+emitted",
-        );
     }
 }
 

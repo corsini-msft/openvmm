@@ -18,7 +18,9 @@ term.workspace = true
 
 disk_backend.workspace = true
 disk_vhd1.workspace = true
+futures.workspace = true
 getrandom.workspace = true
+mesh.workspace = true
 pal_async.workspace = true
 vmgs.workspace = true
 vmgs_format.workspace = true
