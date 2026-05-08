@@ -4,12 +4,6 @@
 output that has been emitted by OpenHCL VTL2 in the **encrypted serial
 console v1** wire format.
 
-> ⚠ The producer side (VTL2 actually emitting encrypted records on COM3) is
-> a planned future PR. The decryptor and the wire-format spec ship first so
-> the producer can be developed against a stable target. Until that PR
-> lands, you can still exercise the tool end-to-end with the
-> [`encrypt_fixture`](#manual-round-trip) helper described below.
-
 The crate currently only builds on Linux, because the underlying
 `crypto::kdf::kbkdf_hmac_sha256` primitive in the workspace `crypto` crate
 is implemented via the Unix-only `openssl_kdf` crate. On Windows hosts, run
@@ -46,6 +40,46 @@ The AES-GCM AAD bound to every record is:
 
 Tampering with the version domain string, the `session_id`, or the `seq`
 will fail tag verification.
+
+### Inter-record framing
+
+Records run **back-to-back** on the wire with no inter-record delimiter:
+
+```
+[[OHENC v1 <base64-A>]][[OHENC v1 <base64-B>]][[OHENC v1 <base64-C>]]
+```
+
+The closing `]]` of one record sits flush against the opening `[[` of the
+next. There is no `\n` between records, and no `\n` after the final record.
+Consumers MUST scan for `[[OHENC v1 ` openers / `]]` closers directly in
+the byte stream and MUST NOT depend on any in-band delimiter.
+
+When encrypted records are interleaved with passthrough plaintext (e.g.
+GRUB output before VTL2 starts encrypting), any bytes outside `[[OHENC v1
+...]]` brackets are forwarded to the consumer's output verbatim. Consumers
+should therefore treat the wire as `(plaintext | record)*` rather than as
+a line-oriented stream.
+
+### Producer flush policy
+
+The producer (`EncryptingSerialIo` in `underhill_core`) emits a record
+when **any** of the following holds:
+
+- The pending plaintext buffer reaches the soft size threshold
+  (`PRODUCER_SOFT_FLUSH_BYTES` = 256 bytes). Mirrors typical TLS record
+  sizing; amortises the ~100 bytes of per-record framing overhead.
+- The buffer reaches the hard upper bound (`MAX_PLAINTEXT_LEN` = 4096
+  bytes). Records cannot be larger than this.
+- The buffer became non-empty `PRODUCER_IDLE_FLUSH` (50 ms) ago and no
+  flush has fired since. Bounds the worst-case latency between a
+  producer write and the corresponding wire record so partial output
+  never sits in the buffer indefinitely.
+
+Byte content does not affect flushing — the producer does not look for
+`\n`, `\r`, or any other terminator. This avoids starving on output
+without line terminators (ANSI escapes, prompts, partial UTF-8 across
+writes) and keeps record boundaries time- and size-bounded rather than
+content-dependent.
 
 ## Per-session keys
 
