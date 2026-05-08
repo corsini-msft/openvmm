@@ -103,14 +103,16 @@ struct StreamKeyArgs {
 
 #[derive(clap::Args, Debug)]
 #[command(
-    group = ArgGroup::new("key_source").required(true).args(["key", "vmgs"]),
+    group = ArgGroup::new("key_source").required(false).args(["key", "vmgs"]),
 )]
 struct BridgeArgs {
     /// Pre-extracted GuestSecretKey blob (raw bytes; up to 2048 bytes).
+    /// Required unless `--plain` is set.
     #[arg(short, long, value_name = "PATH")]
     key: Option<std::path::PathBuf>,
 
     /// Plaintext VMGS file from which to read FileId::GUEST_SECRET_KEY.
+    /// Required unless `--plain` is set.
     #[arg(short, long, value_name = "PATH")]
     vmgs: Option<std::path::PathBuf>,
 
@@ -129,6 +131,15 @@ struct BridgeArgs {
     /// forever; press Ctrl+C to abort.
     #[arg(long)]
     wait: bool,
+
+    /// Bridge raw bytes — skip encryption and decryption entirely.
+    /// In this mode `--key`/`--vmgs` are not required (they are
+    /// ignored if supplied). Intended for debugging the underlying
+    /// pipe transport in isolation from the encryption wrapper;
+    /// the OpenHCL side must also have encryption disabled
+    /// (`OPENHCL_DISABLE_ENCRYPTED_SERIAL=1`).
+    #[arg(long)]
+    plain: bool,
 
     /// Increase log verbosity. Same semantics as on
     /// `decrypt-stream` / `encrypt-stream`.
@@ -286,7 +297,13 @@ fn run_encrypt_stream(args: &StreamKeyArgs) -> std::process::ExitCode {
 }
 
 fn run_bridge(args: &BridgeArgs) -> std::process::ExitCode {
-    match bridge::bridge(&args.key, &args.vmgs, &args.pipe, args.wait) {
+    if !args.plain && args.key.is_none() && args.vmgs.is_none() {
+        eprintln!(
+            "encrypted-serial bridge: one of --key or --vmgs is required (or pass --plain to skip encryption)"
+        );
+        return std::process::ExitCode::from(2);
+    }
+    match bridge::bridge(&args.key, &args.vmgs, &args.pipe, args.wait, args.plain) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("encrypted-serial bridge: {err:#}");

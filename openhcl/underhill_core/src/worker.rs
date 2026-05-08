@@ -277,6 +277,10 @@ pub struct UnderhillEnvCfg {
     /// If true, emulated serial should not poll data until the guest sets DTR
     /// and RTS.
     pub emulated_serial_wait_for_rts: bool,
+    /// If true, do **not** wrap the COM ports with the encrypted-serial
+    /// wrapper; let plaintext flow end-to-end. Debugging knob to
+    /// isolate `EncryptedSerialIo` from the layers underneath it.
+    pub disable_encrypted_serial: bool,
     /// Force load the specified image in VTL0. The image must support the
     /// option specified.
     ///
@@ -2307,7 +2311,16 @@ async fn new_underhill_vm(
 
     // TODO(encrypted-serial-poc): Stub test key for development. Replace
     // with real GSK from platform_attestation_data before production.
-    let encrypted_serial_gks = {
+    //
+    // Set `OPENHCL_DISABLE_ENCRYPTED_SERIAL=1` to skip wrapping COM ports
+    // with `EncryptedSerialIo` for debugging — bytes then flow plaintext
+    // end-to-end through `vmbus_serial_guest`.
+    let encrypted_serial_gks = if env_cfg.disable_encrypted_serial {
+        tracing::info!(
+            "OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper"
+        );
+        None
+    } else {
         let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;

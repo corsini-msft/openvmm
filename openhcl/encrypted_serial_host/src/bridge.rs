@@ -31,6 +31,7 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,12 +47,31 @@ use tracing::warn;
 /// When `wait` is true and the pipe doesn't yet exist (or the open
 /// otherwise fails), retries every 500 ms forever instead of
 /// failing fast. Press Ctrl+C to abort the wait.
+///
+/// When `plain` is true, encryption and decryption are skipped
+/// entirely and bytes are forwarded raw between stdin/stdout and
+/// the pipe. The OpenHCL side of the pipe must also have
+/// encryption disabled (`OPENHCL_DISABLE_ENCRYPTED_SERIAL=1`) for
+/// the guest to receive the bytes correctly.
+///
+/// On Windows, when stdin is attached to a console the bridge
+/// switches it to raw mode for the duration of the session and
+/// reads from `\\.\CONIN$` directly so each keystroke is forwarded
+/// as one record. The console mode is restored on exit. Note that
+/// in raw mode Ctrl+C is forwarded to the VM as a `0x03` byte
+/// instead of terminating the bridge — close the terminal window
+/// to exit.
 pub fn bridge(
     key: &Option<PathBuf>,
     vmgs: &Option<PathBuf>,
     pipe_path: &Path,
     wait: bool,
+    plain: bool,
 ) -> anyhow::Result<()> {
+    if plain {
+        return bridge_plain(pipe_path, wait);
+    }
+
     let gks = Arc::new(super::resolve_key(key, vmgs).context("resolving key source")?);
 
     info!(
@@ -72,6 +92,13 @@ pub fn bridge(
         .try_clone()
         .context("cloning pipe handle for encrypt direction")?;
 
+    // Enable raw stdin mode if we're on a Windows console, so each
+    // keystroke is forwarded immediately rather than waiting for a
+    // newline. The guard restores the console mode on drop, even
+    // if the bridge errors out partway through. On non-Windows or
+    // when stdin isn't a TTY (piped input, tests), this is a no-op.
+    let _raw_guard = enable_raw_input_if_tty()?;
+
     let gks_decrypt = gks.clone();
     let decrypt_thread = thread::Builder::new()
         .name("encrypted-serial-bridge-decrypt".into())
@@ -86,10 +113,20 @@ pub fn bridge(
     let gks_encrypt = gks.clone();
     let encrypt_thread = thread::Builder::new()
         .name("encrypted-serial-bridge-encrypt".into())
-        .spawn(move || -> anyhow::Result<()> {
-            let stdin = std::io::stdin();
-            let mut reader = stdin.lock();
-            encrypt_loop(&gks_encrypt, &mut reader, pipe_for_encrypt)
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut reader = open_keystroke_source()?;
+                encrypt_loop(&gks_encrypt, reader.as_mut(), pipe_for_encrypt)
+            })();
+            // Log the thread's exit reason so a silent failure (which
+            // would otherwise look like a frozen bridge with keystrokes
+            // queueing in the OS console buffer until the process
+            // exits) is observable.
+            match &result {
+                Ok(()) => info!("bridge: encrypt thread exited cleanly (stdin EOF)"),
+                Err(e) => warn!(error = ?e, "bridge: encrypt thread exited with error"),
+            }
+            result
         })
         .context("spawning encrypt thread")?;
 
@@ -105,7 +142,145 @@ pub fn bridge(
         Err(_) => warn!("decrypt thread panicked"),
     }
     drop(encrypt_thread); // detach; process exit will tear it down
+    // _raw_guard drops here, restoring console mode.
     Ok(())
+}
+
+/// Plain-bridge mode: forward raw bytes both directions, bypassing
+/// encryption and decryption entirely. Same threading + raw-mode +
+/// `\\.\CONIN$` handling as [`bridge`], so the test scenario
+/// matches as closely as possible.
+fn bridge_plain(pipe_path: &Path, wait: bool) -> anyhow::Result<()> {
+    info!(
+        sha = build_info::get().scm_revision(),
+        branch = build_info::get().scm_branch(),
+        pipe = ?pipe_path,
+        wait,
+        "bridge started (plain mode: encryption disabled)",
+    );
+
+    let pipe_for_recv = open_pipe_waiting(pipe_path, wait)
+        .with_context(|| format!("opening pipe for recv direction: {pipe_path:?}"))?;
+    let pipe_for_send = pipe_for_recv
+        .try_clone()
+        .context("cloning pipe handle for send direction")?;
+
+    let _raw_guard = enable_raw_input_if_tty()?;
+
+    let recv_thread = thread::Builder::new()
+        .name("encrypted-serial-bridge-plain-recv".into())
+        .spawn(move || -> anyhow::Result<()> {
+            let mut reader = pipe_for_recv;
+            let stdout = std::io::stdout();
+            let mut writer = stdout.lock();
+            plain_copy_loop(&mut reader, &mut writer, "recv")
+        })
+        .context("spawning plain recv thread")?;
+
+    let send_thread = thread::Builder::new()
+        .name("encrypted-serial-bridge-plain-send".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut reader = open_keystroke_source()?;
+                let mut writer = pipe_for_send;
+                plain_copy_loop(reader.as_mut(), &mut writer, "send")
+            })();
+            match &result {
+                Ok(()) => info!("bridge plain: send thread exited cleanly (stdin EOF)"),
+                Err(e) => warn!(error = ?e, "bridge plain: send thread exited with error"),
+            }
+            result
+        })
+        .context("spawning plain send thread")?;
+
+    let recv_result = recv_thread.join();
+    info!("bridge plain: recv direction ended, shutting down");
+    match recv_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = ?e, "plain recv thread returned error"),
+        Err(_) => warn!("plain recv thread panicked"),
+    }
+    drop(send_thread);
+    Ok(())
+}
+
+/// Raw byte-copy loop with the same per-call `debug!` instrumentation
+/// the encrypted path uses, so plain-mode logs are directly
+/// comparable.
+fn plain_copy_loop<R: Read + ?Sized, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    direction: &'static str,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; 4096];
+    let mut total: u64 = 0;
+    loop {
+        debug!(direction, "bridge plain: about to read");
+        let n = reader.read(&mut buf).context("reading")?;
+        debug!(direction, n, "bridge plain: read returned");
+        if n == 0 {
+            info!(direction, total, "bridge plain: EOF");
+            return Ok(());
+        }
+        debug!(direction, bytes = n, "bridge plain: about to write");
+        writer.write_all(&buf[..n]).context("writing")?;
+        debug!(direction, bytes = n, "bridge plain: wrote");
+        writer.flush().context("flushing")?;
+        total += n as u64;
+    }
+}
+
+/// Open the byte source for the encrypt direction.
+///
+/// On Windows when stdin is a console TTY we deliberately bypass
+/// `std::io::Stdin` (which uses `ReadConsoleW` and has its own
+/// buffering quirks in raw mode) and open `\\.\CONIN$` directly.
+/// `File::read` on that handle uses `ReadFile`, which in raw mode
+/// returns each keystroke as it arrives — exactly what the encrypt
+/// loop wants.
+///
+/// On Unix or when stdin isn't a TTY, we just read from stdin
+/// normally.
+fn open_keystroke_source() -> anyhow::Result<Box<dyn Read + Send>> {
+    if cfg!(windows) && std::io::stdin().is_terminal() {
+        let conin = OpenOptions::new()
+            .read(true)
+            .open(r"\\.\CONIN$")
+            .context("opening \\\\.\\CONIN$ for raw keystroke reads")?;
+        Ok(Box::new(conin))
+    } else {
+        Ok(Box::new(std::io::stdin()))
+    }
+}
+
+/// RAII guard returned by [`enable_raw_input_if_tty`]. Restores the
+/// console mode on drop.
+struct RawConsoleGuard {
+    enabled: bool,
+}
+
+impl Drop for RawConsoleGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            if let Err(e) = term::set_raw_console(false) {
+                warn!(error = ?e, "failed to restore console mode on bridge exit");
+            } else {
+                debug!("bridge: restored cooked console mode");
+            }
+        }
+    }
+}
+
+fn enable_raw_input_if_tty() -> anyhow::Result<RawConsoleGuard> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(RawConsoleGuard { enabled: false });
+    }
+    term::set_raw_console(true).context("enabling raw console mode")?;
+    info!(
+        "bridge: stdin is a TTY, enabled raw mode (Ctrl+C forwarded to VM; \
+         close the terminal window to exit)",
+    );
+    Ok(RawConsoleGuard { enabled: true })
 }
 
 /// Open the named pipe, optionally retrying until it succeeds.
@@ -210,7 +385,7 @@ fn decrypt_loop<R: BufRead, W: Write>(
 /// record (higher framing overhead but predictable latency).
 /// Chunks larger than `MAX_PLAINTEXT_LEN` are split across multiple
 /// records.
-fn encrypt_loop<R: Read>(
+fn encrypt_loop<R: Read + ?Sized>(
     gks: &GksKeyMaterial,
     reader: &mut R,
     mut writer: impl Write,
@@ -230,7 +405,9 @@ fn encrypt_loop<R: Read>(
 
     let mut buf = vec![0u8; MAX_PLAINTEXT_LEN];
     loop {
+        debug!("bridge encrypt: about to read");
         let n = reader.read(&mut buf).context("reading stdin")?;
+        debug!(n, "bridge encrypt: read returned");
         if n == 0 {
             info!(
                 total_in,
@@ -254,13 +431,21 @@ fn encrypt_loop<R: Read>(
                 ciphertext,
                 tag,
             };
+            let encoded = record.encode_to_string();
+            debug!(
+                seq,
+                bytes = encoded.len(),
+                "bridge encrypt: about to write record",
+            );
             // Wire framing: just the sentinel back-to-back, no
             // delimiter — matches the in-VM producer's contract.
-            write!(writer, "{}", record.encode_to_string())
+            write!(writer, "{encoded}")
                 .context("writing record to pipe")?;
+            debug!(seq, "bridge encrypt: wrote record");
             seq += 1;
             total_records += 1;
         }
+        debug!("bridge encrypt: about to flush");
         writer.flush().context("flushing pipe")?;
         debug!(
             bytes_in = n,
