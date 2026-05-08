@@ -49,9 +49,9 @@ enum Commands {
     /// production provisioning tool; see the module docs in
     /// `provision.rs`.
     ProvisionGsk(ProvisionGskArgs),
-    /// Print build info (git SHA, branch, wire-format version) and exit.
-    /// Useful for verifying that a freshly-built binary actually contains
-    /// a specific change rather than a stale cached binary.
+    /// Print build info (git SHA, branch) and exit. Useful for
+    /// verifying that a freshly-built binary actually contains a
+    /// specific change rather than a stale cached binary.
     Version,
 }
 
@@ -168,8 +168,15 @@ struct BridgeArgs {
     #[arg(long)]
     plain: bool,
 
-    /// Increase log verbosity. Same semantics as on
-    /// `decrypt-stream` / `encrypt-stream`.
+    /// Increase log verbosity. Pass `--verbose` for debug-level
+    /// (per-record / per-fill summaries). Pass twice
+    /// (`--verbose --verbose`) for trace-level (also includes
+    /// per-call read/write logs and hex dumps of input bytes).
+    ///
+    /// Equivalent to setting `RUST_LOG=encrypted_serial=debug` (or
+    /// `=trace`). Logs are written to stderr; pipe traffic
+    /// continues to go to stdout, so this is safe to leave on
+    /// while piping output to a file.
     #[arg(long, action = clap::ArgAction::Count)]
     verbose: u8,
 }

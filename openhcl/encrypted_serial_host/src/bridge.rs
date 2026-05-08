@@ -21,7 +21,7 @@
 //! Stdin reads still happen on a dedicated synchronous OS thread,
 //! since neither std nor pal_async offer asynchronous stdin on
 //! Windows. The thread forwards typed bytes to the async send task
-//! over a `futures::channel::mpsc` channel.
+//! over a `mesh::channel`.
 
 use anyhow::Context;
 use futures::AsyncReadExt;
@@ -49,6 +49,7 @@ use std::thread;
 use std::time::Duration;
 use tracing::debug;
 use tracing::info;
+use tracing::trace;
 use tracing::warn;
 
 /// Bridge stdin <-> a bidirectional pipe (Hyper-V named pipe or
@@ -93,49 +94,27 @@ pub fn bridge(
     );
 
     DefaultPool::run_with(async move |driver| -> anyhow::Result<()> {
-        let pipe = open_pipe_waiting(pipe_path, wait)
-            .with_context(|| format!("opening pipe: {pipe_path:?}"))?;
-        let polled =
-            PolledPipe::new(&driver, pipe).context("wrapping pipe for async I/O")?;
-        let (pipe_reader, pipe_writer) = polled.split();
-
-        let _raw_guard = enable_raw_input_if_tty()?;
-
-        // Sync stdin → channel → async encrypt task. See module
-        // doc on why stdin stays on its own OS thread.
-        let (stdin_tx, stdin_rx) = mesh::channel::<Vec<u8>>();
-        let _stdin_thread = thread::Builder::new()
-            .name("encrypted-serial-bridge-stdin".into())
-            .spawn(move || stdin_reader_loop(stdin_tx))
-            .context("spawning stdin reader thread")?;
+        let io = setup_bridge_io(&driver, pipe_path, wait, "encrypted-serial-bridge-stdin")?;
+        let BridgeIo {
+            pipe_reader,
+            pipe_writer,
+            stdin_rx,
+            _raw_guard,
+        } = io;
 
         let gks_decrypt = gks.clone();
-        let decrypt_task = driver.spawn("bridge-decrypt", async move {
+        let recv_task = driver.spawn("bridge-decrypt", async move {
             decrypt_loop(&gks_decrypt, pipe_reader).await
         });
 
         let gks_encrypt = gks.clone();
-        let encrypt_task = driver.spawn("bridge-encrypt", async move {
+        let send_task = driver.spawn("bridge-encrypt", async move {
             let result = encrypt_loop(&gks_encrypt, stdin_rx, pipe_writer).await;
-            match &result {
-                Ok(()) => info!("bridge: encrypt task exited cleanly (stdin EOF)"),
-                Err(e) => warn!(error = ?e, "bridge: encrypt task exited with error"),
-            }
+            log_send_exit("bridge", &result);
             result
         });
 
-        // Wait for the decrypt direction to end (pipe closed by
-        // VTL2 or read error). When that happens, exit. Drop the
-        // encrypt task so its receiver goes away — that closes
-        // the channel and lets the stdin thread exit on its next
-        // send (or stays blocked in `read`, in which case the
-        // process exit terminates it).
-        let decrypt_result = decrypt_task.await;
-        info!("bridge: decrypt direction ended, shutting down");
-        if let Err(e) = decrypt_result {
-            warn!(error = ?e, "decrypt task returned error");
-        }
-        drop(encrypt_task);
+        await_recv_then_drop_send("bridge", recv_task, send_task).await;
         Ok(())
     })?;
     Ok(())
@@ -154,19 +133,14 @@ fn bridge_plain(pipe_path: &Path, wait: bool) -> anyhow::Result<()> {
     );
 
     DefaultPool::run_with(async move |driver| -> anyhow::Result<()> {
-        let pipe = open_pipe_waiting(pipe_path, wait)
-            .with_context(|| format!("opening pipe: {pipe_path:?}"))?;
-        let polled =
-            PolledPipe::new(&driver, pipe).context("wrapping pipe for async I/O")?;
-        let (pipe_reader, pipe_writer) = polled.split();
-
-        let _raw_guard = enable_raw_input_if_tty()?;
-
-        let (stdin_tx, stdin_rx) = mesh::channel::<Vec<u8>>();
-        let _stdin_thread = thread::Builder::new()
-            .name("encrypted-serial-bridge-plain-stdin".into())
-            .spawn(move || stdin_reader_loop(stdin_tx))
-            .context("spawning stdin reader thread")?;
+        let io =
+            setup_bridge_io(&driver, pipe_path, wait, "encrypted-serial-bridge-plain-stdin")?;
+        let BridgeIo {
+            pipe_reader,
+            pipe_writer,
+            stdin_rx,
+            _raw_guard,
+        } = io;
 
         let recv_task = driver.spawn("bridge-plain-recv", async move {
             plain_recv_loop(pipe_reader).await
@@ -174,22 +148,91 @@ fn bridge_plain(pipe_path: &Path, wait: bool) -> anyhow::Result<()> {
 
         let send_task = driver.spawn("bridge-plain-send", async move {
             let result = plain_send_loop(stdin_rx, pipe_writer).await;
-            match &result {
-                Ok(()) => info!("bridge plain: send task exited cleanly (stdin EOF)"),
-                Err(e) => warn!(error = ?e, "bridge plain: send task exited with error"),
-            }
+            log_send_exit("bridge plain", &result);
             result
         });
 
-        let recv_result = recv_task.await;
-        info!("bridge plain: recv direction ended, shutting down");
-        if let Err(e) = recv_result {
-            warn!(error = ?e, "bridge plain: recv task returned error");
-        }
-        drop(send_task);
+        await_recv_then_drop_send("bridge plain", recv_task, send_task).await;
         Ok(())
     })?;
     Ok(())
+}
+
+/// Plumbing shared by both bridge modes: opened pipe split into a
+/// non-blocking reader/writer pair, a stdin -> async-task channel,
+/// and the RAII guard that restores the cooked console mode on drop.
+struct BridgeIo {
+    pipe_reader: futures::io::ReadHalf<PolledPipe>,
+    pipe_writer: futures::io::WriteHalf<PolledPipe>,
+    stdin_rx: mesh::Receiver<Vec<u8>>,
+    _raw_guard: RawConsoleGuard,
+}
+
+/// One-stop setup of the I/O scaffolding both `bridge()` and
+/// `bridge_plain()` need: open the pipe (waiting if requested),
+/// wrap it in `PolledPipe`, switch the console to raw mode, spawn
+/// the synchronous stdin reader thread, and hand back the resulting
+/// channels and RAII guard.
+///
+/// `stdin_thread_name` is used as the spawned thread's name so it
+/// shows up identifiably in panic backtraces / debugger output.
+fn setup_bridge_io(
+    driver: &impl pal_async::driver::Driver,
+    pipe_path: &Path,
+    wait: bool,
+    stdin_thread_name: &str,
+) -> anyhow::Result<BridgeIo> {
+    let pipe = open_pipe_waiting(pipe_path, wait)
+        .with_context(|| format!("opening pipe: {pipe_path:?}"))?;
+    let polled = PolledPipe::new(driver, pipe).context("wrapping pipe for async I/O")?;
+    let (pipe_reader, pipe_writer) = polled.split();
+
+    let raw_guard = enable_raw_input_if_tty()?;
+
+    // Sync stdin → channel → async send/encrypt task. See module
+    // doc on why stdin stays on its own OS thread.
+    let (stdin_tx, stdin_rx) = mesh::channel::<Vec<u8>>();
+    thread::Builder::new()
+        .name(stdin_thread_name.into())
+        .spawn(move || stdin_reader_loop(stdin_tx))
+        .context("spawning stdin reader thread")?;
+
+    Ok(BridgeIo {
+        pipe_reader,
+        pipe_writer,
+        stdin_rx,
+        _raw_guard: raw_guard,
+    })
+}
+
+/// Wait for the recv direction to end (pipe closed by the VM, or a
+/// read error). Drop the send task; the receiver going away closes
+/// the channel, and the stdin OS thread will exit on its next send
+/// (or stay blocked in `read`, in which case process exit terminates
+/// it).
+async fn await_recv_then_drop_send<R, S>(
+    label: &'static str,
+    recv_task: pal_async::task::Task<R>,
+    send_task: pal_async::task::Task<S>,
+) where
+    R: 'static + Send + std::fmt::Debug,
+    S: 'static + Send,
+{
+    let recv_result = recv_task.await;
+    info!(label, "bridge: recv direction ended, shutting down");
+    debug!(label, recv_result = ?recv_result, "bridge recv result");
+    drop(send_task);
+}
+
+/// Log the send-side task's exit reason. Silent failures here would
+/// otherwise look like a frozen bridge with keystrokes queueing in
+/// the OS console buffer until the process exits, so the warning is
+/// load-bearing.
+fn log_send_exit(label: &'static str, result: &anyhow::Result<()>) {
+    match result {
+        Ok(()) => info!(label, "bridge: send task exited cleanly (stdin EOF)"),
+        Err(e) => warn!(label, error = ?e, "bridge: send task exited with error"),
+    }
 }
 
 /// Synchronous stdin reader. Runs in its own OS thread; forwards
@@ -203,9 +246,9 @@ fn stdin_reader_loop(sender: mesh::Sender<Vec<u8>>) {
         let mut reader = open_keystroke_source()?;
         let mut buf = vec![0u8; 4096];
         loop {
-            debug!("bridge stdin: about to read");
+            trace!("bridge stdin: about to read");
             let n = reader.read(&mut buf).context("reading stdin")?;
-            debug!(n, "bridge stdin: read returned");
+            trace!(n, "bridge stdin: read returned");
             if n == 0 {
                 info!("bridge stdin: EOF");
                 return Ok(());
@@ -250,10 +293,11 @@ where
             );
             return Ok(());
         }
-        debug!(
+        trace!(
+            direction = "recv",
             bytes = n,
             buf_before = scanner.buffered(),
-            "bridge decrypt: fill_buf",
+            "bridge: read from pipe",
         );
         scanner.extend(&buf[..n]);
         total_in += n as u64;
@@ -295,7 +339,7 @@ where
 
     while let Some(bytes) = stdin_rx.next().await {
         let n = bytes.len();
-        debug!(n, "bridge encrypt: received from stdin");
+        trace!(direction = "send", bytes = n, "bridge: received from stdin");
         total_in += n as u64;
         for chunk in bytes.chunks(MAX_PLAINTEXT_LEN) {
             let mut nonce = [0u8; NONCE_LEN];
@@ -312,10 +356,11 @@ where
                 tag,
             };
             let encoded = record.encode_to_string();
-            debug!(
+            trace!(
+                direction = "send",
                 seq,
                 bytes = encoded.len(),
-                "bridge encrypt: about to write record",
+                "bridge: about to write record",
             );
             // Wire framing: just the sentinel back-to-back, no
             // delimiter — matches the in-VM producer's contract.
@@ -323,16 +368,17 @@ where
                 .write_all(encoded.as_bytes())
                 .await
                 .context("writing record to pipe")?;
-            debug!(seq, "bridge encrypt: wrote record");
+            trace!(direction = "send", seq, "bridge: wrote record");
             seq += 1;
             total_records += 1;
         }
-        debug!("bridge encrypt: about to flush");
+        trace!(direction = "send", "bridge: about to flush");
         writer.flush().await.context("flushing pipe")?;
         debug!(
+            direction = "send",
             bytes_in = n,
             records_emitted = total_records,
-            "bridge encrypt: read+emitted",
+            "bridge: read+emitted",
         );
     }
     info!(
@@ -353,12 +399,12 @@ where
     let mut buf = vec![0u8; 4096];
     let mut total: u64 = 0;
     loop {
-        debug!(direction = "recv", "bridge plain: about to read");
+        trace!(direction = "recv", "bridge plain: about to read");
         let n = reader
             .read(&mut buf)
             .await
             .context("reading from pipe")?;
-        debug!(direction = "recv", n, "bridge plain: read returned");
+        trace!(direction = "recv", n, "bridge plain: read returned");
         // Don't hold the StdoutLock across await; lock per chunk.
         let stdout = std::io::stdout();
         let mut writer = stdout.lock();
@@ -383,12 +429,12 @@ where
     let mut total: u64 = 0;
     while let Some(bytes) = stdin_rx.next().await {
         let n = bytes.len();
-        debug!(direction = "send", bytes = n, "bridge plain: about to write");
+        trace!(direction = "send", bytes = n, "bridge plain: about to write");
         writer
             .write_all(&bytes)
             .await
             .context("writing to pipe")?;
-        debug!(direction = "send", bytes = n, "bridge plain: wrote");
+        trace!(direction = "send", bytes = n, "bridge plain: wrote");
         writer.flush().await.context("flushing pipe")?;
         total += n as u64;
     }

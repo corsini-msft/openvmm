@@ -15,10 +15,11 @@
 //!   risking nonce reuse across reboots.
 //!
 //! This crate is intentionally small and dependency-light so that the
-//! producer side (which lives inside OpenHCL VTL2) can depend on it
-//! without inheriting CLI, filesystem, async, or VMGS dependencies.
-//! The host-side encryptor / decryptor CLI lives in the separate
-//! `encrypted_serial_host` crate.
+//! in-VM consumers and producers (the VTL2 `EncryptedSerialIo`
+//! wrapper, the kmsg encrypter) can depend on it without inheriting
+//! CLI, filesystem, async, or VMGS dependencies. The host-side CLI
+//! that decrypts captures and bridges interactive serial sessions
+//! lives in the separate `encrypted_serial_host` crate.
 //!
 //! The crate is currently Linux-only, matching the
 //! `openhcl/underhill_attestation` pattern, because
