@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
+tpm_protocol.workspace = true
 
 disk_backend.workspace = true
 disk_vhd1.workspace = true
@@ -26,11 +27,11 @@ clap = { workspace = true, features = ["derive"] }
 fs-err.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zerocopy.workspace = true
 
 [dev-dependencies]
 disklayer_ram.workspace = true
 tempfile.workspace = true
-zerocopy.workspace = true
 
 [lints]
 workspace = true

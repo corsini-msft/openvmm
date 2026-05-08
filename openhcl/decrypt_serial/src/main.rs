@@ -12,6 +12,7 @@
 
 mod decrypt;
 mod key_source;
+mod provision;
 mod stream;
 
 use clap::ArgGroup;
@@ -36,6 +37,11 @@ enum Commands {
     /// Stream-encrypt from stdin, writing encrypted records to stdout.
     /// Reads line-by-line for live pipe usage.
     StreamEncrypt(StreamKeyArgs),
+    /// Developer-only: seed `FileId::GUEST_SECRET_KEY` in a plaintext
+    /// VMGS file with random or caller-supplied bytes. Not a
+    /// production provisioning tool; see the module docs in
+    /// `provision.rs`.
+    ProvisionGsk(ProvisionGskArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -62,6 +68,27 @@ struct DecryptArgs {
     /// Treat the first malformed sentinel or decrypt failure as fatal.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(
+    group = ArgGroup::new("provision_source").required(true).args(["from_blob"]),
+)]
+struct ProvisionGskArgs {
+    /// Plaintext VMGS file to provision. Must be opened read-write
+    /// and must not be encrypted.
+    #[arg(short, long, value_name = "PATH")]
+    vmgs: std::path::PathBuf,
+
+    /// Read a TPM2_Import duplicate blob (no inner wrapping key)
+    /// from a file. Validated against the same parser the vTPM
+    /// uses at first boot before being written.
+    #[arg(long, value_name = "PATH")]
+    from_blob: Option<std::path::PathBuf>,
+
+    /// Overwrite an existing FileId::GUEST_SECRET_KEY entry.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -117,6 +144,28 @@ fn main() -> std::process::ExitCode {
         Commands::Decrypt(args) => run_decrypt(&args),
         Commands::StreamDecrypt(args) => run_stream_decrypt(&args),
         Commands::StreamEncrypt(args) => run_stream_encrypt(&args),
+        Commands::ProvisionGsk(args) => run_provision_gsk(&args),
+    }
+}
+
+fn run_provision_gsk(args: &ProvisionGskArgs) -> std::process::ExitCode {
+    let source = if let Some(p) = args.from_blob.as_ref() {
+        provision::ProvisionSource::FromBlob(p.clone())
+    } else {
+        unreachable!("clap ArgGroup ensures --from-blob is set")
+    };
+    let result = pal_async::DefaultPool::run_with(async |_| {
+        provision::provision(&args.vmgs, source, args.force).await
+    });
+    match result {
+        Ok(()) => {
+            tracing::info!("decrypt-serial provision-gsk: wrote GUEST_SECRET_KEY");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("decrypt-serial provision-gsk: {err:#}");
+            std::process::ExitCode::from(1)
+        }
     }
 }
 
@@ -130,7 +179,6 @@ fn resolve_key(
         _ => unreachable!("clap ArgGroup ensures exactly one of --key or --vmgs is set"),
     };
     pal_async::DefaultPool::run_with(async |_| key_source::resolve(&source).await)
-        .map_err(Into::into)
 }
 
 fn run_decrypt(args: &DecryptArgs) -> std::process::ExitCode {
