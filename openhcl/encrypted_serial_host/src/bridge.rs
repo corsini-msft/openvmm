@@ -30,7 +30,7 @@ use futures::StreamExt;
 use openhcl_serial_console_crypto::consts::MAX_PLAINTEXT_LEN;
 use openhcl_serial_console_crypto::consts::NONCE_LEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
-use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
@@ -83,7 +83,7 @@ pub fn bridge(
         return bridge_plain(pipe_path, wait);
     }
 
-    let gks = Arc::new(super::resolve_key(key, vmgs).context("resolving key source")?);
+    let gsk = Arc::new(super::resolve_key(key, vmgs).context("resolving key source")?);
 
     info!(
         sha = build_info::get().scm_revision(),
@@ -102,14 +102,14 @@ pub fn bridge(
             _raw_guard,
         } = io;
 
-        let gks_decrypt = gks.clone();
+        let gsk_decrypt = gsk.clone();
         let recv_task = driver.spawn("bridge-decrypt", async move {
-            decrypt_loop(&gks_decrypt, pipe_reader).await
+            decrypt_loop(&gsk_decrypt, pipe_reader).await
         });
 
-        let gks_encrypt = gks.clone();
+        let gsk_encrypt = gsk.clone();
         let send_task = driver.spawn("bridge-encrypt", async move {
-            let result = encrypt_loop(&gks_encrypt, stdin_rx, pipe_writer).await;
+            let result = encrypt_loop(&gsk_encrypt, stdin_rx, pipe_writer).await;
             log_send_exit("bridge", &result);
             result
         });
@@ -265,7 +265,7 @@ fn stdin_reader_loop(sender: mesh::Sender<Vec<u8>>) {
 /// (and pass through any non-sentinel bytes), write plaintext to
 /// stdout. Stdout writes stay synchronous — they're fast and don't
 /// block on remote events.
-async fn decrypt_loop<R>(gks: &GksKeyMaterial, mut reader: R) -> anyhow::Result<()>
+async fn decrypt_loop<R>(gsk: &GskKeyMaterial, mut reader: R) -> anyhow::Result<()>
 where
     R: futures::AsyncRead + Unpin,
 {
@@ -281,7 +281,7 @@ where
         let mut writer = stdout.lock();
         if n == 0 {
             let stats = scanner
-                .drain(gks, /* at_eof */ true, &mut writer)
+                .drain(gsk, /* at_eof */ true, &mut writer)
                 .context("draining at EOF")?;
             total_out += stats.bytes_out;
             writer.flush().context("flushing stdout")?;
@@ -302,7 +302,7 @@ where
         scanner.extend(&buf[..n]);
         total_in += n as u64;
         let stats = scanner
-            .drain(gks, /* at_eof */ false, &mut writer)
+            .drain(gsk, /* at_eof */ false, &mut writer)
             .context("draining")?;
         total_out += stats.bytes_out;
         writer.flush().context("flushing stdout")?;
@@ -317,7 +317,7 @@ where
 /// split into `MAX_PLAINTEXT_LEN`-sized chunks and each chunk is
 /// encrypted into its own record.
 async fn encrypt_loop<W>(
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     mut stdin_rx: mesh::Receiver<Vec<u8>>,
     mut writer: W,
 ) -> anyhow::Result<()>
@@ -327,7 +327,7 @@ where
     let mut session_id = [0u8; SESSION_ID_LEN];
     getrandom::fill(&mut session_id)
         .map_err(|e| anyhow::anyhow!("generating session_id: {e}"))?;
-    let aes_key = derive_aes_key(gks, &session_id).context("deriving AES key")?;
+    let aes_key = derive_aes_key(gsk, &session_id).context("deriving AES key")?;
     let mut seq: u64 = 0;
     let mut total_in: u64 = 0;
     let mut total_records: u64 = 0;

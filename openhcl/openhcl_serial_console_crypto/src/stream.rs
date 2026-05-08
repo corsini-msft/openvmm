@@ -25,7 +25,7 @@ use crate::consts::MAX_SENTINEL_BASE64_LEN;
 use crate::consts::SENTINEL_CLOSE;
 use crate::consts::SENTINEL_OPEN;
 use crate::consts::SESSION_ID_LEN;
-use crate::crypto::GksKeyMaterial;
+use crate::crypto::GskKeyMaterial;
 use crate::crypto::derive_aes_key;
 use crate::crypto::decrypt as aes_decrypt;
 use crate::format::Record;
@@ -109,7 +109,7 @@ impl StreamScanner {
     /// followed by a resumed scan from the next byte.
     pub fn drain(
         &mut self,
-        gks: &GksKeyMaterial,
+        gsk: &GskKeyMaterial,
         at_eof: bool,
         writer: &mut dyn io::Write,
     ) -> io::Result<DrainStats> {
@@ -128,7 +128,7 @@ impl StreamScanner {
                         writer.write_all(chunk)?;
                         stats.bytes_out += chunk.len() as u64;
                     }
-                    let n = decrypt_and_write(gks, &mut self.keys, &payload, writer)?;
+                    let n = decrypt_and_write(gsk, &mut self.keys, &payload, writer)?;
                     stats.bytes_out += n.bytes_written as u64;
                     if n.success {
                         stats.records_ok += 1;
@@ -198,7 +198,7 @@ struct DecryptOutcome {
 }
 
 fn decrypt_and_write(
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     keys: &mut HashMap<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>,
     payload: &[u8],
     writer: &mut dyn io::Write,
@@ -206,7 +206,7 @@ fn decrypt_and_write(
     match Record::parse_payload(payload) {
         Ok(record) => {
             let key = keys.entry(record.session_id).or_insert_with(|| {
-                derive_aes_key(gks, &record.session_id).expect("KDF should not fail")
+                derive_aes_key(gsk, &record.session_id).expect("KDF should not fail")
             });
             match aes_decrypt(
                 key,
@@ -248,22 +248,22 @@ fn decrypt_and_write(
 mod tests {
     use super::*;
     use crate::consts::NONCE_LEN;
-    use crate::crypto::GKS_LEN;
+    use crate::crypto::GSK_LEN;
     use crate::crypto::encrypt as aes_encrypt;
 
-    fn test_gks() -> GksKeyMaterial {
-        let mut buf = [0u8; GKS_LEN];
+    fn test_gsk() -> GskKeyMaterial {
+        let mut buf = [0u8; GSK_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
         }
-        GksKeyMaterial(buf)
+        GskKeyMaterial(buf)
     }
 
     /// Build one wire-format record for the given plaintext under a
     /// fresh random session_id and nonce. Returns the bytes that
     /// would appear on the wire.
     fn build_record(plaintext: &[u8], session_id: [u8; SESSION_ID_LEN], seq: u64) -> Vec<u8> {
-        let aes_key: [u8; AES_KEY_LEN] = derive_aes_key(&test_gks(), &session_id).unwrap();
+        let aes_key: [u8; AES_KEY_LEN] = derive_aes_key(&test_gsk(), &session_id).unwrap();
         let mut nonce = [0u8; NONCE_LEN];
         for (i, b) in nonce.iter_mut().enumerate() {
             *b = ((i + (seq as usize)) & 0xff) as u8;
@@ -296,7 +296,7 @@ mod tests {
         scanner.extend(&wire);
 
         let mut out = Vec::new();
-        let stats = scanner.drain(&test_gks(), false, &mut out).unwrap();
+        let stats = scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(out, b"hello\n");
         assert_eq!(stats.records_ok, 1);
         assert_eq!(stats.records_failed, 0);
@@ -313,12 +313,12 @@ mod tests {
         let mut scanner = StreamScanner::new();
         scanner.extend(&wire[..split]);
         let mut out = Vec::new();
-        let stats = scanner.drain(&test_gks(), false, &mut out).unwrap();
+        let stats = scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(out, b"", "partial sentinel should not emit yet");
         assert_eq!(stats.records_ok, 0);
 
         scanner.extend(&wire[split..]);
-        let stats = scanner.drain(&test_gks(), false, &mut out).unwrap();
+        let stats = scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(out, b"two-step\n");
         assert_eq!(stats.records_ok, 1);
         assert_eq!(scanner.buffered(), 0);
@@ -335,7 +335,7 @@ mod tests {
         let mut scanner = StreamScanner::new();
         scanner.extend(&wire);
         let mut out = Vec::new();
-        scanner.drain(&test_gks(), true, &mut out).unwrap();
+        scanner.drain(&test_gsk(), true, &mut out).unwrap();
         assert_eq!(out, b"prefix middle\n suffix");
     }
 
@@ -351,7 +351,7 @@ mod tests {
         let mut out = Vec::new();
         // at_eof=true so the trailing 10 bytes don't get held back
         // by the straddle-protection prefix in the NotFound branch.
-        scanner.drain(&test_gks(), true, &mut out).unwrap();
+        scanner.drain(&test_gsk(), true, &mut out).unwrap();
         assert_eq!(out, wire);
     }
 
@@ -361,7 +361,7 @@ mod tests {
         scanner.extend(b"plain prefix [[OHENC v1 ");
 
         let mut out = Vec::new();
-        scanner.drain(&test_gks(), true, &mut out).unwrap();
+        scanner.drain(&test_gsk(), true, &mut out).unwrap();
         assert_eq!(out, b"plain prefix [[OHENC v1 ");
         assert_eq!(scanner.buffered(), 0);
     }
@@ -378,7 +378,7 @@ mod tests {
         let mut scanner = StreamScanner::new();
         scanner.extend(&wire);
         let mut out = Vec::new();
-        let stats = scanner.drain(&test_gks(), false, &mut out).unwrap();
+        let stats = scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(out, b"alpha\nbravo\nalpha2\n");
         assert_eq!(stats.records_ok, 3);
         assert_eq!(scanner.sessions(), 2);
@@ -395,7 +395,7 @@ mod tests {
         let mut scanner = StreamScanner::new();
         scanner.extend(&wire);
         let mut out = Vec::new();
-        scanner.drain(&test_gks(), false, &mut out).unwrap();
+        scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(out, b"abc");
     }
 
@@ -403,7 +403,7 @@ mod tests {
     fn no_data_drain_is_noop() {
         let mut scanner = StreamScanner::new();
         let mut out = Vec::new();
-        let stats = scanner.drain(&test_gks(), false, &mut out).unwrap();
+        let stats = scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(stats, DrainStats::default());
         assert!(out.is_empty());
     }
@@ -421,12 +421,12 @@ mod tests {
         let mut scanner = StreamScanner::new();
         scanner.extend(b"hello [[OHENC v");
         let mut out = Vec::new();
-        scanner.drain(&test_gks(), false, &mut out).unwrap();
+        scanner.drain(&test_gsk(), false, &mut out).unwrap();
         assert_eq!(out, b"hello");
         assert_eq!(scanner.buffered(), b" [[OHENC v".len());
 
         scanner.extend(b"oops not a sentinel\n");
-        scanner.drain(&test_gks(), true, &mut out).unwrap();
+        scanner.drain(&test_gsk(), true, &mut out).unwrap();
         assert_eq!(out, b"hello [[OHENC voops not a sentinel\n");
     }
 }

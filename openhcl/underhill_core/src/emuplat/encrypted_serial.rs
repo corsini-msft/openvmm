@@ -19,7 +19,7 @@ use openhcl_serial_console_crypto::consts::NONCE_LEN;
 use openhcl_serial_console_crypto::consts::PRODUCER_IDLE_FLUSH;
 use openhcl_serial_console_crypto::consts::PRODUCER_SOFT_FLUSH_BYTES;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
-use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
@@ -62,7 +62,7 @@ impl ResourceId<SerialBackendHandle> for EncryptedSerialBackendHandle {
 /// material used for AES-256-GCM key derivation.
 pub struct EncryptedSerialBackendResolver {
     /// The guest secret key material used to derive per-session AES keys.
-    pub gks: Arc<GksKeyMaterial>,
+    pub gsk: Arc<GskKeyMaterial>,
 }
 
 #[async_trait]
@@ -94,10 +94,10 @@ impl AsyncResolveResource<SerialBackendHandle, EncryptedSerialBackendHandle>
             .map_err(|e| anyhow::anyhow!("failed to generate session_id: {e}"))?;
 
         // Derive the per-session AES key.
-        let aes_key = derive_aes_key(&self.gks, &session_id)
+        let aes_key = derive_aes_key(&self.gsk, &session_id)
             .map_err(|e| anyhow::anyhow!("failed to derive AES key: {e}"))?;
 
-        let wrapper = EncryptedSerialIo::new(inner_io, aes_key, session_id, timer, self.gks.clone());
+        let wrapper = EncryptedSerialIo::new(inner_io, aes_key, session_id, timer, self.gsk.clone());
         Ok(ResolvedSerialBackend(Box::new(EncryptedSerialBackend {
             wrapper,
         })))
@@ -146,7 +146,7 @@ impl serial_core::resources::SerialBackend for EncryptedSerialBackend {
 /// # Two independent sessions
 ///
 /// The producer (write side) and consumer (read side) each run their
-/// own AES-256-GCM session, both keyed off the shared GKS but with
+/// own AES-256-GCM session, both keyed off the shared GSK but with
 /// distinct `session_id`s. Distinct keys mean the two directions
 /// can share one wire transport without risking nonce collision.
 /// The producer's `session_id` is generated once at startup; the
@@ -217,10 +217,10 @@ pub struct EncryptedSerialIo {
     /// Decrypted plaintext (and passthrough) bytes ready to deliver
     /// to the guest via `poll_read`.
     consumer_plaintext_out: VecDeque<u8>,
-    /// GKS reference shared with the resolver. The consumer uses it
+    /// GSK reference shared with the resolver. The consumer uses it
     /// to derive AES keys for each new session_id observed in
     /// incoming records.
-    gks: Arc<GksKeyMaterial>,
+    gsk: Arc<GskKeyMaterial>,
 }
 
 impl InspectMut for EncryptedSerialIo {
@@ -252,7 +252,7 @@ impl EncryptedSerialIo {
         aes_key: [u8; 32],
         session_id: [u8; SESSION_ID_LEN],
         timer: PolledTimer,
-        gks: Arc<GksKeyMaterial>,
+        gsk: Arc<GskKeyMaterial>,
     ) -> Self {
         Self {
             inner,
@@ -265,7 +265,7 @@ impl EncryptedSerialIo {
             flush_deadline: None,
             consumer_scanner: StreamScanner::new(),
             consumer_plaintext_out: VecDeque::new(),
-            gks,
+            gsk,
         }
     }
 
@@ -436,7 +436,7 @@ impl AsyncRead for EncryptedSerialIo {
                 let this = self.as_mut().get_mut();
                 let mut writer = VecDequeWriter(&mut this.consumer_plaintext_out);
                 this.consumer_scanner
-                    .drain(&this.gks, /* at_eof */ true, &mut writer)
+                    .drain(&this.gsk, /* at_eof */ true, &mut writer)
                     .map_err(io::Error::other)?;
                 if this.consumer_plaintext_out.is_empty() {
                     return Poll::Ready(Ok(0));
@@ -452,7 +452,7 @@ impl AsyncRead for EncryptedSerialIo {
             this.consumer_scanner.extend(&scratch[..n]);
             let mut writer = VecDequeWriter(&mut this.consumer_plaintext_out);
             this.consumer_scanner
-                .drain(&this.gks, /* at_eof */ false, &mut writer)
+                .drain(&this.gsk, /* at_eof */ false, &mut writer)
                 .map_err(io::Error::other)?;
 
             // 4. Loop. If the scanner produced plaintext, the next
@@ -730,23 +730,23 @@ mod tests {
         let (backend, ctl) = CapturingBackend::new();
         let timer = PolledTimer::new(driver);
         let session_id = test_session_id();
-        let gks = Arc::new(test_gks());
+        let gsk = Arc::new(test_gsk());
         let wrapper = EncryptedSerialIo::new(
             Box::new(backend),
             test_aes_key(),
             session_id,
             timer,
-            gks,
+            gsk,
         );
         (wrapper, ctl)
     }
 
-    fn test_gks() -> GksKeyMaterial {
-        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+    fn test_gsk() -> GskKeyMaterial {
+        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GSK_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
         }
-        GksKeyMaterial(buf)
+        GskKeyMaterial(buf)
     }
 
     fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
@@ -944,13 +944,13 @@ mod tests {
     use openhcl_serial_console_crypto::format::Record as TestRecord;
     use futures::AsyncReadExt;
 
-    /// Build one wire-format record under the test GKS.
+    /// Build one wire-format record under the test GSK.
     fn build_inbound_record(
         plaintext: &[u8],
         session_id: [u8; TEST_SESSION_ID_LEN],
         seq: u64,
     ) -> Vec<u8> {
-        let aes_key: [u8; AES_KEY_LEN] = test_derive_aes_key(&test_gks(), &session_id).unwrap();
+        let aes_key: [u8; AES_KEY_LEN] = test_derive_aes_key(&test_gsk(), &session_id).unwrap();
         let mut nonce = [0u8; TEST_NONCE_LEN];
         for (i, b) in nonce.iter_mut().enumerate() {
             *b = ((i as u64 + seq) & 0xff) as u8;

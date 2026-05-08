@@ -12,7 +12,7 @@ use anyhow::bail;
 use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
 use openhcl_serial_console_crypto::crypto;
-use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
 use openhcl_serial_console_crypto::format::Record;
 use openhcl_serial_console_crypto::format::SentinelMatch;
 use openhcl_serial_console_crypto::format::find_next_sentinel;
@@ -45,7 +45,7 @@ pub struct DecryptStats {
 pub fn run(
     input: &[u8],
     output: &mut impl Write,
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     strict: bool,
 ) -> anyhow::Result<DecryptStats> {
     let mut state = SessionState::new();
@@ -69,7 +69,7 @@ pub fn run(
                     .write_all(&input[cursor..start])
                     .context("writing leading plaintext before record")?;
                 match Record::parse_payload(&payload) {
-                    Ok(record) => match try_decrypt(gks, &record, &mut state) {
+                    Ok(record) => match try_decrypt(gsk, &record, &mut state) {
                         Ok(plaintext) => {
                             output
                                 .write_all(&plaintext)
@@ -133,12 +133,12 @@ impl SessionState {
 
     fn aes_key(
         &mut self,
-        gks: &GksKeyMaterial,
+        gsk: &GskKeyMaterial,
         session_id: &[u8; SESSION_ID_LEN],
     ) -> anyhow::Result<&[u8; AES_KEY_LEN]> {
         if !self.keys.contains_key(session_id) {
-            let key = crypto::derive_aes_key(gks, session_id)
-                .context("deriving per-session AES key from GKS")?;
+            let key = crypto::derive_aes_key(gsk, session_id)
+                .context("deriving per-session AES key from GSK")?;
             self.keys.insert(*session_id, key);
         }
         Ok(self.keys.get(session_id).expect("just inserted above"))
@@ -146,11 +146,11 @@ impl SessionState {
 }
 
 fn try_decrypt(
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     record: &Record,
     state: &mut SessionState,
 ) -> anyhow::Result<Vec<u8>> {
-    let key = *state.aes_key(gks, &record.session_id)?;
+    let key = *state.aes_key(gsk, &record.session_id)?;
     let plaintext = crypto::decrypt(
         &key,
         &record.session_id,
@@ -203,27 +203,27 @@ fn handle_failure(
 mod tests {
     use super::*;
     use openhcl_serial_console_crypto::consts::NONCE_LEN;
-    use openhcl_serial_console_crypto::crypto::GKS_LEN;
+    use openhcl_serial_console_crypto::crypto::GSK_LEN;
     use openhcl_serial_console_crypto::crypto::derive_aes_key;
     use openhcl_serial_console_crypto::crypto::encrypt;
     use openhcl_serial_console_crypto::format::Record;
 
-    fn sample_gks() -> GksKeyMaterial {
-        let mut buf = [0u8; GKS_LEN];
+    fn sample_gsk() -> GskKeyMaterial {
+        let mut buf = [0u8; GSK_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
         }
-        GksKeyMaterial(buf)
+        GskKeyMaterial(buf)
     }
 
     fn make_record(
-        gks: &GksKeyMaterial,
+        gsk: &GskKeyMaterial,
         session_id: [u8; SESSION_ID_LEN],
         seq: u64,
         nonce: [u8; NONCE_LEN],
         plaintext: &[u8],
     ) -> Record {
-        let key = derive_aes_key(gks, &session_id).unwrap();
+        let key = derive_aes_key(gsk, &session_id).unwrap();
         let (ciphertext, tag) = encrypt(&key, &session_id, seq, &nonce, plaintext).unwrap();
         Record {
             session_id,
@@ -236,11 +236,11 @@ mod tests {
 
     #[test]
     fn round_trip_single_record_no_passthrough() {
-        let gks = sample_gks();
-        let r = make_record(&gks, [0xa1; SESSION_ID_LEN], 0, [0xb1; NONCE_LEN], b"hello");
+        let gsk = sample_gsk();
+        let r = make_record(&gsk, [0xa1; SESSION_ID_LEN], 0, [0xb1; NONCE_LEN], b"hello");
         let input = r.encode_to_string();
         let mut out = Vec::new();
-        let stats = run(input.as_bytes(), &mut out, &gks, false).unwrap();
+        let stats = run(input.as_bytes(), &mut out, &gsk, false).unwrap();
         assert_eq!(out, b"hello");
         assert_eq!(stats.records_ok, 1);
         assert_eq!(stats.records_failed, 0);
@@ -249,10 +249,10 @@ mod tests {
 
     #[test]
     fn passthrough_around_records() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session = [0xa2; SESSION_ID_LEN];
-        let r1 = make_record(&gks, session, 0, [0x10; NONCE_LEN], b"ONE");
-        let r2 = make_record(&gks, session, 1, [0x11; NONCE_LEN], b"TWO");
+        let r1 = make_record(&gsk, session, 0, [0x10; NONCE_LEN], b"ONE");
+        let r2 = make_record(&gsk, session, 1, [0x11; NONCE_LEN], b"TWO");
 
         let mut input = b"prefix\n".to_vec();
         input.extend_from_slice(r1.encode_to_string().as_bytes());
@@ -261,19 +261,19 @@ mod tests {
         input.extend_from_slice(b"\ntrailing");
 
         let mut out = Vec::new();
-        let stats = run(&input, &mut out, &gks, false).unwrap();
+        let stats = run(&input, &mut out, &gsk, false).unwrap();
         assert_eq!(out, b"prefix\nONE\nmiddle\nTWO\ntrailing");
         assert_eq!(stats.records_ok, 2);
     }
 
     #[test]
     fn multi_session_capture() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let s1 = [0xc1; SESSION_ID_LEN];
         let s2 = [0xc2; SESSION_ID_LEN];
-        let r1 = make_record(&gks, s1, 0, [0x10; NONCE_LEN], b"A");
-        let r2 = make_record(&gks, s2, 0, [0x10; NONCE_LEN], b"B");
-        let r3 = make_record(&gks, s1, 1, [0x11; NONCE_LEN], b"C");
+        let r1 = make_record(&gsk, s1, 0, [0x10; NONCE_LEN], b"A");
+        let r2 = make_record(&gsk, s2, 0, [0x10; NONCE_LEN], b"B");
+        let r3 = make_record(&gsk, s1, 1, [0x11; NONCE_LEN], b"C");
 
         let input = format!(
             "{}\n{}\n{}\n",
@@ -282,7 +282,7 @@ mod tests {
             r3.encode_to_string(),
         );
         let mut out = Vec::new();
-        let stats = run(input.as_bytes(), &mut out, &gks, false).unwrap();
+        let stats = run(input.as_bytes(), &mut out, &gsk, false).unwrap();
         assert_eq!(out, b"A\nB\nC\n");
         assert_eq!(stats.records_ok, 3);
         assert_eq!(stats.sessions_observed, 2);
@@ -290,12 +290,12 @@ mod tests {
 
     #[test]
     fn tampered_tag_default_emits_marker() {
-        let gks = sample_gks();
-        let mut r = make_record(&gks, [0xd1; SESSION_ID_LEN], 0, [0xee; NONCE_LEN], b"x");
+        let gsk = sample_gsk();
+        let mut r = make_record(&gsk, [0xd1; SESSION_ID_LEN], 0, [0xee; NONCE_LEN], b"x");
         r.tag[0] ^= 1;
         let input = r.encode_to_string();
         let mut out = Vec::new();
-        let stats = run(input.as_bytes(), &mut out, &gks, false).unwrap();
+        let stats = run(input.as_bytes(), &mut out, &gsk, false).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("<<decrypt failed offset="), "got: {s:?}");
         assert_eq!(stats.records_ok, 0);
@@ -304,12 +304,12 @@ mod tests {
 
     #[test]
     fn tampered_tag_strict_errors() {
-        let gks = sample_gks();
-        let mut r = make_record(&gks, [0xd2; SESSION_ID_LEN], 0, [0xee; NONCE_LEN], b"x");
+        let gsk = sample_gsk();
+        let mut r = make_record(&gsk, [0xd2; SESSION_ID_LEN], 0, [0xee; NONCE_LEN], b"x");
         r.tag[0] ^= 1;
         let input = r.encode_to_string();
         let mut out = Vec::new();
-        let err = run(input.as_bytes(), &mut out, &gks, true).unwrap_err();
+        let err = run(input.as_bytes(), &mut out, &gsk, true).unwrap_err();
         assert!(err.to_string().contains("offset"), "got: {err:#}");
     }
 
@@ -318,10 +318,10 @@ mod tests {
         // Plaintext containing the literal opening sentinel but not
         // a valid base64 body. Default mode must NOT eat it; strict
         // mode rejects.
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let input = b"hello [[OHENC v1 not_valid_base64_content_here]] world";
         let mut out = Vec::new();
-        let stats = run(input, &mut out, &gks, false).unwrap();
+        let stats = run(input, &mut out, &gsk, false).unwrap();
         // We pass through `[`, then the rest of the sentinel-looking
         // text gets re-scanned for sentinels and ultimately ends up
         // in the output unchanged. The exact byte-for-byte output
@@ -335,18 +335,18 @@ mod tests {
 
     #[test]
     fn malformed_sentinel_strict_errors() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let input = b"[[OHENC v1 not_valid_base64_content]]";
         let mut out = Vec::new();
-        let err = run(input, &mut out, &gks, true).unwrap_err();
+        let err = run(input, &mut out, &gsk, true).unwrap_err();
         assert!(err.to_string().contains("malformed"), "got: {err:#}");
     }
 
     #[test]
     fn empty_input_produces_empty_output() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let mut out = Vec::new();
-        let stats = run(b"", &mut out, &gks, false).unwrap();
+        let stats = run(b"", &mut out, &gsk, false).unwrap();
         assert!(out.is_empty());
         assert_eq!(stats.records_ok, 0);
     }

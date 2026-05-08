@@ -208,12 +208,12 @@ pub fn init_tracing(spawn: impl Spawn, tracer: RemoteTracer) -> anyhow::Result<(
     // with real GSK before production.
     let kmsg_writer = {
         let inner = kmsg_writer::KmsgWriter::new(kmsg_defs::UNDERHILL_KMSG_FACILITY)?;
-        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GSK_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
         }
-        let gks = openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf);
-        crate::emuplat::encrypted_kmsg::EncryptingKmsgWriter::new(inner, &gks)
+        let gsk = openhcl_serial_console_crypto::crypto::GskKeyMaterial(buf);
+        crate::emuplat::encrypted_kmsg::EncryptingKmsgWriter::new(inner, &gsk)
             .context("failed to create encrypting kmsg writer")?
     };
     let kmsg_layer = tracing_subscriber::fmt::layer()

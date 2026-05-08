@@ -12,9 +12,9 @@
 //!
 //! ```text
 //! cargo run --example encrypt_fixture -p encrypted-serial -- \
-//!     --key gks.bin --input my.log > capture.txt
+//!     --key gsk.bin --input my.log > capture.txt
 //! cargo run -p encrypted-serial -- decrypt-file \
-//!     --key gks.bin --input capture.txt
+//!     --key gsk.bin --input capture.txt
 //! # output should equal my.log
 //! ```
 //!
@@ -107,7 +107,7 @@ fn main() -> anyhow::Result<()> {
             .context("reading stdin")?;
     }
 
-    let gks = pal_async::DefaultPool::run_with(async |_| key_source::resolve(&source).await)
+    let gsk = pal_async::DefaultPool::run_with(async |_| key_source::resolve(&source).await)
         .context("resolving key source")?;
 
     // Generate one fresh session_id for this run.
@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
     getrandom::fill(&mut session_id)
         .map_err(|e| anyhow::anyhow!("generating random session_id: {e}"))?;
 
-    let aes_key = derive_aes_key(&gks, &session_id).context("deriving AES key")?;
+    let aes_key = derive_aes_key(&gsk, &session_id).context("deriving AES key")?;
 
     let mut out: Box<dyn Write> = match args.output.as_ref() {
         Some(p) => Box::new(fs_err::File::create(p).context("creating --output file")?),

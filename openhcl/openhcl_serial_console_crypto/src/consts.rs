@@ -16,7 +16,7 @@ pub const NONCE_LEN: usize = 12;
 /// record.
 pub const TAG_LEN: usize = 16;
 
-/// Length in bytes of the AES-256-GCM key derived from the GKS.
+/// Length in bytes of the AES-256-GCM key derived from the GSK.
 pub const AES_KEY_LEN: usize = 32;
 
 /// Maximum plaintext (and therefore ciphertext) length in bytes for a
@@ -61,7 +61,7 @@ pub const SENTINEL_CLOSE: &[u8] = b"]]";
 pub const AAD_DOMAIN: &[u8] = b"OpenHCL encrypted serial console v1 AES-256-GCM\0";
 
 /// Context label for the SP800-108 KBKDF derivation that turns the
-/// 2048-byte GKS into a per-session AES-256-GCM key.
+/// 2048-byte GSK into a per-session AES-256-GCM key.
 pub const KDF_LABEL: &[u8] = b"OpenHCL encrypted serial console v1 AES-256-GCM key";
 
 /// Soft size threshold for producer flushes.

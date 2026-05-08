@@ -17,36 +17,36 @@ use thiserror::Error;
 /// to make it harder to accidentally pass arbitrary bytes to
 /// [`derive_aes_key`].
 #[derive(Clone)]
-pub struct GksKeyMaterial(pub [u8; GKS_LEN]);
+pub struct GskKeyMaterial(pub [u8; GSK_LEN]);
 
-/// Length in bytes of the GKS blob carried in
+/// Length in bytes of the GSK blob carried in
 /// `FileId::GUEST_SECRET_KEY`. Mirrors the value in
 /// `openhcl_attestation_protocol::vmgs::GUEST_SECRET_KEY_MAX_SIZE`;
 /// duplicated here so this crate does not need to depend on the
 /// attestation-protocol crate.
-pub const GKS_LEN: usize = 2048;
+pub const GSK_LEN: usize = 2048;
 
-const _: () = assert!(GKS_LEN > 0);
+const _: () = assert!(GSK_LEN > 0);
 
-impl std::fmt::Debug for GksKeyMaterial {
+impl std::fmt::Debug for GskKeyMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't dump 2 KiB of secret bytes in Debug output.
-        f.debug_struct("GksKeyMaterial")
+        f.debug_struct("GskKeyMaterial")
             .field("len", &self.0.len())
             .finish_non_exhaustive()
     }
 }
 
-/// Derive the per-session AES-256-GCM key from the GKS blob and the
+/// Derive the per-session AES-256-GCM key from the GSK blob and the
 /// session identifier carried in the record.
 ///
 /// The decryptor caches the resulting key per `session_id` so it does
 /// not re-run the KDF for every record.
 pub fn derive_aes_key(
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     session_id: &[u8; SESSION_ID_LEN],
 ) -> Result<[u8; AES_KEY_LEN], CryptoError> {
-    let derived = crypto::kdf::kbkdf_hmac_sha256(&gks.0, KDF_LABEL, session_id, AES_KEY_LEN)
+    let derived = crypto::kdf::kbkdf_hmac_sha256(&gsk.0, KDF_LABEL, session_id, AES_KEY_LEN)
         .map_err(CryptoError::Kdf)?;
     let arr: [u8; AES_KEY_LEN] = derived
         .as_slice()
@@ -105,7 +105,7 @@ pub fn decrypt(
 #[derive(Debug, Error)]
 pub enum CryptoError {
     /// The KDF backend failed.
-    #[error("failed to derive AES key from GKS")]
+    #[error("failed to derive AES key from GSK")]
     Kdf(#[source] crypto::kdf::KdfError),
     /// The AES-256-GCM backend failed (e.g. tag verification).
     #[error("AES-256-GCM operation failed")]
@@ -122,21 +122,21 @@ pub enum CryptoError {
 mod tests {
     use super::*;
 
-    fn sample_gks() -> GksKeyMaterial {
+    fn sample_gsk() -> GskKeyMaterial {
         // Deterministic but non-trivial fill so the KDF KAT below is
         // stable.
-        let mut buf = [0u8; GKS_LEN];
+        let mut buf = [0u8; GSK_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
         }
-        GksKeyMaterial(buf)
+        GskKeyMaterial(buf)
     }
 
     #[test]
     fn round_trip() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0xaau8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x11u8; NONCE_LEN];
         let plain = b"hello, encrypted serial console";
 
@@ -147,9 +147,9 @@ mod tests {
 
     #[test]
     fn empty_plaintext_round_trips() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0x55u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x22u8; NONCE_LEN];
 
         let (cipher, tag) = encrypt(&key, &session_id, 0, &nonce, b"").unwrap();
@@ -160,9 +160,9 @@ mod tests {
 
     #[test]
     fn aad_binding_session_id() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0x55u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x33u8; NONCE_LEN];
         let plain = b"x";
 
@@ -175,9 +175,9 @@ mod tests {
 
     #[test]
     fn aad_binding_seq() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0x66u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x44u8; NONCE_LEN];
         let plain = b"x";
 
@@ -188,9 +188,9 @@ mod tests {
 
     #[test]
     fn nonce_tampering() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0x77u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x55u8; NONCE_LEN];
         let plain = b"abc";
 
@@ -203,9 +203,9 @@ mod tests {
 
     #[test]
     fn ciphertext_tampering() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0x88u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x66u8; NONCE_LEN];
         let plain = b"abc";
 
@@ -218,9 +218,9 @@ mod tests {
 
     #[test]
     fn tag_tampering() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0x99u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0x77u8; NONCE_LEN];
         let plain = b"abc";
 
@@ -232,11 +232,11 @@ mod tests {
 
     #[test]
     fn per_session_key_isolation() {
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_a = [0x01u8; SESSION_ID_LEN];
         let session_b = [0x02u8; SESSION_ID_LEN];
-        let key_a = derive_aes_key(&gks, &session_a).unwrap();
-        let key_b = derive_aes_key(&gks, &session_b).unwrap();
+        let key_a = derive_aes_key(&gsk, &session_a).unwrap();
+        let key_b = derive_aes_key(&gsk, &session_b).unwrap();
         assert_ne!(
             key_a, key_b,
             "different sessions must derive different keys"
@@ -257,13 +257,13 @@ mod tests {
 
     #[test]
     fn kdf_known_answer() {
-        // Pin the GKS+session_id -> AES key derivation. If a future
+        // Pin the GSK+session_id -> AES key derivation. If a future
         // change to the KDF label, output length, or salt usage
         // breaks this test, that is by design -- the producer side
         // must derive the same key bit-for-bit.
-        let gks = sample_gks();
+        let gsk = sample_gsk();
         let session_id = [0u8; SESSION_ID_LEN];
-        let key = derive_aes_key(&gks, &session_id).unwrap();
+        let key = derive_aes_key(&gsk, &session_id).unwrap();
         let expected = "1185504272035c98351142cd7d80ab533de43b5b0bb2fffe8c4180e68ddbd4ce";
         assert_eq!(hex::encode(key), expected);
     }

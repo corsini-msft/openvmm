@@ -158,7 +158,7 @@ mod tests {
     use disklayer_ram::ram_disk;
     use openhcl_serial_console_crypto::consts::NONCE_LEN;
     use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
-    use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+    use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
     use openhcl_serial_console_crypto::crypto::decrypt;
     use openhcl_serial_console_crypto::crypto::derive_aes_key;
     use openhcl_serial_console_crypto::crypto::encrypt;
@@ -176,13 +176,13 @@ mod tests {
         disk
     }
 
-    /// Read the GSK slot back as `GksKeyMaterial` (matches the
+    /// Read the GSK slot back as `GskKeyMaterial` (matches the
     /// consumer path in `key_source::resolve`).
-    async fn read_back(disk: Disk) -> GksKeyMaterial {
+    async fn read_back(disk: Disk) -> GskKeyMaterial {
         let mut vmgs = Vmgs::open(disk, None).await.unwrap();
         let bytes = vmgs.read_file_raw(FileId::GUEST_SECRET_KEY).await.unwrap();
         let payload = GuestSecretKey::read_from_bytes(bytes.as_slice()).unwrap();
-        GksKeyMaterial(payload.guest_secret_key)
+        GskKeyMaterial(payload.guest_secret_key)
     }
 
     fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -252,16 +252,16 @@ mod tests {
             .await
             .unwrap();
 
-        let gks = read_back(disk).await;
-        assert_eq!(gks.0, payload, "round-trip mismatch");
+        let gsk = read_back(disk).await;
+        assert_eq!(gsk.0, payload, "round-trip mismatch");
 
         // The same VMGS bytes should serve both consumers: vTPM
         // (via ImportCmd) and encrypted serial (via KBKDF).
-        validate_importable_blob(&gks.0[..VALID_BLOB.len()]).unwrap();
+        validate_importable_blob(&gsk.0[..VALID_BLOB.len()]).unwrap();
 
         // Encrypt/decrypt round-trip with the derived key.
         let session_id = [7u8; SESSION_ID_LEN];
-        let aes_key = derive_aes_key(&gks, &session_id).unwrap();
+        let aes_key = derive_aes_key(&gsk, &session_id).unwrap();
         let nonce = [0u8; NONCE_LEN];
         let plaintext = b"hello provision-gsk";
         let (ciphertext, tag) = encrypt(&aes_key, &session_id, 0, &nonce, plaintext).unwrap();
@@ -296,7 +296,7 @@ mod tests {
         provision_on_disk(disk.clone(), &p1, false).await.unwrap();
         provision_on_disk(disk.clone(), &p2, true).await.unwrap();
 
-        let gks = read_back(disk).await;
-        assert_eq!(gks.0[VALID_BLOB.len()], 0xCC);
+        let gsk = read_back(disk).await;
+        assert_eq!(gsk.0[VALID_BLOB.len()], 0xCC);
     }
 }

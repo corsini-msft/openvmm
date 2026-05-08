@@ -7,7 +7,7 @@ use anyhow::Context;
 use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
 use openhcl_serial_console_crypto::crypto;
-use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
 use openhcl_serial_console_crypto::format::Record;
 use openhcl_serial_console_crypto::format::SentinelMatch;
 use openhcl_serial_console_crypto::format::find_next_sentinel;
@@ -18,7 +18,7 @@ use std::sync::Mutex;
 /// Holds key material and session state for decrypting sentinels
 /// inline within kmsg lines.
 pub struct KmsgDecryptor {
-    gks: GksKeyMaterial,
+    gsk: GskKeyMaterial,
     state: Mutex<DecryptState>,
 }
 
@@ -31,15 +31,15 @@ impl KmsgDecryptor {
     pub fn new(key_path: &Path) -> anyhow::Result<Self> {
         let key_bytes = fs_err::read(key_path).context("reading --decrypt-key file")?;
         anyhow::ensure!(
-            !key_bytes.is_empty() && key_bytes.len() <= crypto::GKS_LEN,
+            !key_bytes.is_empty() && key_bytes.len() <= crypto::GSK_LEN,
             "key file must be 1..={} bytes, got {}",
-            crypto::GKS_LEN,
+            crypto::GSK_LEN,
             key_bytes.len()
         );
-        let mut buf = [0u8; crypto::GKS_LEN];
+        let mut buf = [0u8; crypto::GSK_LEN];
         buf[..key_bytes.len()].copy_from_slice(&key_bytes);
         Ok(Self {
-            gks: GksKeyMaterial(buf),
+            gsk: GskKeyMaterial(buf),
             state: Mutex::new(DecryptState {
                 keys: HashMap::new(),
             }),
@@ -100,7 +100,7 @@ impl KmsgDecryptor {
         let key = if let Some(key) = state.keys.get(&record.session_id) {
             *key
         } else {
-            let key = crypto::derive_aes_key(&self.gks, &record.session_id)
+            let key = crypto::derive_aes_key(&self.gsk, &record.session_id)
                 .context("deriving AES key")?;
             state.keys.insert(record.session_id, key);
             key
