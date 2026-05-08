@@ -212,16 +212,6 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Distinctive feature marker for this build. Bump when the wire
-/// format or scanner contract changes meaningfully so users can
-/// tell apart "old binary" vs "new binary" without grepping for a
-/// SHA. Current values:
-///
-/// - `v1-back-to-back-no-lf`: producer emits records back-to-back
-///   on the wire with no inter-record `\n`; consumer is a streaming
-///   sentinel scanner that doesn't depend on any in-band delimiter.
-const FEATURE_MARKER: &str = "v1-back-to-back-no-lf";
-
 fn run_version() -> std::process::ExitCode {
     let info = build_info::get();
     println!("encrypted-serial");
@@ -242,8 +232,6 @@ fn run_version() -> std::process::ExitCode {
             info.scm_branch()
         }
     );
-    println!("  wire format:     {FEATURE_MARKER}");
-    println!("  features:        --verbose, streaming sentinel scanner");
     std::process::ExitCode::SUCCESS
 }
 
