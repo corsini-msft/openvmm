@@ -182,13 +182,17 @@ impl EncryptingSerialIo {
                 break;
             }
 
-            // Find the next newline to split on.
-            let chunk = if let Some(nl_pos) = self.plaintext_buf.iter().position(|&b| b == b'\n') {
+            // Find the next newline to split on, but never exceed
+            // MAX_PLAINTEXT_LEN in a single record (the consumer
+            // rejects anything larger).
+            let nl_pos = self.plaintext_buf.iter().position(|&b| b == b'\n');
+            let chunk = if let Some(nl_pos) = nl_pos.filter(|&p| p < MAX_PLAINTEXT_LEN) {
                 // Include the newline in the record.
                 let chunk: Vec<u8> = self.plaintext_buf.drain(..=nl_pos).collect();
                 chunk
             } else if self.plaintext_buf.len() >= MAX_PLAINTEXT_LEN {
-                // Buffer overflow — flush a max-size chunk.
+                // Either no newline within the cap, or the line is
+                // longer than MAX_PLAINTEXT_LEN — split at the cap.
                 let chunk: Vec<u8> = self.plaintext_buf.drain(..MAX_PLAINTEXT_LEN).collect();
                 chunk
             } else if flush_partial {
