@@ -23,6 +23,7 @@ use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
+use openhcl_serial_console_crypto::stream::StreamScanner;
 use pal_async::timer::Instant;
 use pal_async::timer::PolledTimer;
 use serial_core::SerialIo;
@@ -96,24 +97,20 @@ impl AsyncResolveResource<SerialBackendHandle, EncryptedSerialBackendHandle>
         let aes_key = derive_aes_key(&self.gks, &session_id)
             .map_err(|e| anyhow::anyhow!("failed to derive AES key: {e}"))?;
 
-        let wrapper = EncryptingSerialIo::new(inner_io, aes_key, session_id, timer);
-        Ok(ResolvedSerialBackend(Box::new(EncryptingSerialBackend {
+        let wrapper = EncryptedSerialIo::new(inner_io, aes_key, session_id, timer, self.gks.clone());
+        Ok(ResolvedSerialBackend(Box::new(EncryptedSerialBackend {
             wrapper,
-            gks: self.gks.clone(),
         })))
     }
 }
 
-/// A resolved encrypting serial backend. Wraps the inner IO and
-/// provides `SerialBackend` implementation.
-struct EncryptingSerialBackend {
-    wrapper: EncryptingSerialIo,
-    /// Retained for potential re-keying or resource reclamation.
-    #[expect(dead_code)]
-    gks: Arc<GksKeyMaterial>,
+/// A resolved encrypted serial backend. Wraps the inner IO and
+/// provides the [`SerialBackend`] implementation.
+struct EncryptedSerialBackend {
+    wrapper: EncryptedSerialIo,
 }
 
-impl serial_core::resources::SerialBackend for EncryptingSerialBackend {
+impl serial_core::resources::SerialBackend for EncryptedSerialBackend {
     fn into_resource(self: Box<Self>) -> Resource<SerialBackendHandle> {
         // We cannot reclaim the original resource after wrapping, so
         // return a disconnected placeholder. This is acceptable for
@@ -134,11 +131,11 @@ impl serial_core::resources::SerialBackend for EncryptingSerialBackend {
     }
 }
 
-/// Wraps a `Box<dyn SerialIo>` and encrypts all writes using
-/// AES-256-GCM before forwarding them as `[[OHENC v1 ...]]` records.
-///
-/// Reads are passed through unmodified (decryption of incoming data
-/// is not implemented).
+/// Wraps a `Box<dyn SerialIo>` and runs encrypted serial in BOTH
+/// directions: outgoing writes (from the guest VTL) get encrypted as
+/// `[[OHENC v1 ...]]` records before reaching the inner transport,
+/// and incoming reads from the inner transport get decrypted before
+/// being delivered to the guest.
 ///
 /// # Wire framing
 ///
@@ -146,7 +143,17 @@ impl serial_core::resources::SerialBackend for EncryptingSerialBackend {
 /// delimiter — `]]` already terminates each record unambiguously.
 /// Records run back-to-back on the wire (`[[..]][[..]][[..]]`).
 ///
-/// # Flush policy
+/// # Two independent sessions
+///
+/// The producer (write side) and consumer (read side) each run their
+/// own AES-256-GCM session, both keyed off the shared GKS but with
+/// distinct `session_id`s. Distinct keys mean the two directions
+/// can share one wire transport without risking nonce collision.
+/// The producer's `session_id` is generated once at startup; the
+/// consumer's `session_id`s are observed in incoming records and
+/// cached per-session in the [`StreamScanner`].
+///
+/// # Producer flush policy
 ///
 /// The encryptor maintains a small plaintext staging buffer. It
 /// emits a record (and tries to start draining it onto the inner
@@ -171,8 +178,20 @@ impl serial_core::resources::SerialBackend for EncryptingSerialBackend {
 /// behaviour starved on output without line terminators (ANSI
 /// escapes, prompts, partial UTF-8 across writes) and was just
 /// glibc-style line buffering with the same brittleness.
-pub struct EncryptingSerialIo {
+///
+/// # Consumer behaviour
+///
+/// On `poll_read`, the wrapper pulls bytes from the inner transport
+/// into a small scratch buffer, feeds them to a [`StreamScanner`],
+/// and returns the decrypted plaintext (or any non-sentinel
+/// passthrough bytes) to the guest UART. Plaintext bytes that
+/// don't belong to any sentinel are forwarded verbatim, matching
+/// the host-side decoder behaviour and preserving backward
+/// compatibility with plaintext-only host clients.
+pub struct EncryptedSerialIo {
     inner: Box<dyn SerialIo>,
+
+    // Producer state.
     aes_key: [u8; 32],
     session_id: [u8; SESSION_ID_LEN],
     seq: u64,
@@ -190,9 +209,21 @@ pub struct EncryptingSerialIo {
     /// flushed if no other flush trigger fires first. `None` when the
     /// buffer is empty (or has just been flushed).
     flush_deadline: Option<Instant>,
+
+    // Consumer state.
+    /// Streaming sentinel scanner for decrypting incoming records.
+    /// Owns its own per-session AES key cache.
+    consumer_scanner: StreamScanner,
+    /// Decrypted plaintext (and passthrough) bytes ready to deliver
+    /// to the guest via `poll_read`.
+    consumer_plaintext_out: VecDeque<u8>,
+    /// GKS reference shared with the resolver. The consumer uses it
+    /// to derive AES keys for each new session_id observed in
+    /// incoming records.
+    gks: Arc<GksKeyMaterial>,
 }
 
-impl InspectMut for EncryptingSerialIo {
+impl InspectMut for EncryptedSerialIo {
     fn inspect_mut(&mut self, req: inspect::Request<'_>) {
         let mut resp = req.respond();
         resp.field("seq", self.seq)
@@ -202,16 +233,26 @@ impl InspectMut for EncryptingSerialIo {
                 "flush_deadline_in_ms",
                 self.flush_deadline
                     .map(|d| d.saturating_sub(Instant::now()).as_millis() as u64),
-            );
+            )
+            .field(
+                "consumer_buffered_wire",
+                self.consumer_scanner.buffered(),
+            )
+            .field(
+                "consumer_plaintext_pending",
+                self.consumer_plaintext_out.len(),
+            )
+            .field("consumer_sessions", self.consumer_scanner.sessions());
     }
 }
 
-impl EncryptingSerialIo {
+impl EncryptedSerialIo {
     fn new(
         inner: Box<dyn SerialIo>,
         aes_key: [u8; 32],
         session_id: [u8; SESSION_ID_LEN],
         timer: PolledTimer,
+        gks: Arc<GksKeyMaterial>,
     ) -> Self {
         Self {
             inner,
@@ -222,6 +263,9 @@ impl EncryptingSerialIo {
             output_buf: VecDeque::new(),
             timer,
             flush_deadline: None,
+            consumer_scanner: StreamScanner::new(),
+            consumer_plaintext_out: VecDeque::new(),
+            gks,
         }
     }
 
@@ -230,7 +274,7 @@ impl EncryptingSerialIo {
     /// is empty. Clears the idle-flush deadline.
     ///
     /// Callers decide when to invoke this (see the flush-policy
-    /// docs on [`EncryptingSerialIo`]). The function itself imposes
+    /// docs on [`EncryptedSerialIo`]). The function itself imposes
     /// no policy beyond the per-record size cap.
     fn flush_plaintext_to_output(&mut self) -> Result<(), io::Error> {
         while !self.plaintext_buf.is_empty() {
@@ -313,7 +357,7 @@ impl EncryptingSerialIo {
     }
 }
 
-impl SerialIo for EncryptingSerialIo {
+impl SerialIo for EncryptedSerialIo {
     fn is_connected(&self) -> bool {
         self.inner.is_connected()
     }
@@ -327,7 +371,12 @@ impl SerialIo for EncryptingSerialIo {
     }
 }
 
-impl AsyncRead for EncryptingSerialIo {
+/// Scratch buffer size used by [`EncryptedSerialIo::poll_read`] when
+/// pulling bytes from the inner transport into the scanner. One
+/// `inner.poll_read` ever produces at most this many bytes per call.
+const READ_SCRATCH_LEN: usize = 4096;
+
+impl AsyncRead for EncryptedSerialIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -342,7 +391,7 @@ impl AsyncRead for EncryptingSerialIo {
         // here. Without the drain on this path, partial writes that
         // hit only the idle-flush trigger get encrypted into
         // `output_buf` but never make it to the inner transport,
-        // so the consumer sees nothing past the most recent
+        // so the host sees nothing past the most recent
         // soft-threshold flush.
         //
         // Errors propagate; Pending from the write side does NOT
@@ -351,8 +400,67 @@ impl AsyncRead for EncryptingSerialIo {
             return Poll::Ready(Err(e));
         }
 
-        // Pass through reads unmodified.
-        Pin::new(&mut *self.inner).poll_read(cx, buf)
+        // Loop: keep pulling wire bytes from the inner and feeding
+        // them through the scanner until we either have plaintext
+        // ready to deliver, hit EOF, or genuinely have to wait for
+        // more inner bytes. A single inner read can land in the
+        // middle of a sentinel (e.g. the inner's read budget caps
+        // out before the full record arrives), in which case the
+        // scanner emits nothing and we have to immediately try
+        // pulling more — without that loop we'd return Pending with
+        // no waker registered (the inner only registers its waker
+        // when *it* returns Pending), and the task would hang.
+        loop {
+            // 1. Return any plaintext we already decrypted.
+            if !self.consumer_plaintext_out.is_empty() {
+                return Poll::Ready(Ok(copy_out(
+                    &mut self.consumer_plaintext_out,
+                    buf,
+                )));
+            }
+
+            // 2. Pull more wire bytes from the inner transport.
+            let mut scratch = [0u8; READ_SCRATCH_LEN];
+            let max = scratch.len().min(buf.len().max(1));
+            let n = match Pin::new(&mut *self.inner).poll_read(cx, &mut scratch[..max]) {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+
+            if n == 0 {
+                // EOF on the inner. Flush any in-flight scanner
+                // state as passthrough into the plaintext queue;
+                // then either deliver it or report EOF to the
+                // caller.
+                let this = self.as_mut().get_mut();
+                let mut writer = VecDequeWriter(&mut this.consumer_plaintext_out);
+                this.consumer_scanner
+                    .drain(&this.gks, /* at_eof */ true, &mut writer)
+                    .map_err(io::Error::other)?;
+                if this.consumer_plaintext_out.is_empty() {
+                    return Poll::Ready(Ok(0));
+                }
+                return Poll::Ready(Ok(copy_out(
+                    &mut this.consumer_plaintext_out,
+                    buf,
+                )));
+            }
+
+            // 3. Feed those bytes through the scanner.
+            let this = self.as_mut().get_mut();
+            this.consumer_scanner.extend(&scratch[..n]);
+            let mut writer = VecDequeWriter(&mut this.consumer_plaintext_out);
+            this.consumer_scanner
+                .drain(&this.gks, /* at_eof */ false, &mut writer)
+                .map_err(io::Error::other)?;
+
+            // 4. Loop. If the scanner produced plaintext, the next
+            //    iteration's check at step 1 will return it. If it
+            //    didn't (partial sentinel), the next iteration
+            //    pulls more from inner — eventually inner returns
+            //    Pending (and registers its waker) or Ok(0).
+        }
     }
 
     fn poll_read_vectored(
@@ -360,14 +468,43 @@ impl AsyncRead for EncryptingSerialIo {
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        if let Poll::Ready(Err(e)) = self.poll_drain_output(cx) {
-            return Poll::Ready(Err(e));
+        // Find the first non-empty buffer and delegate to poll_read
+        // with it. Vectored reads on a serial port are a curiosity at
+        // best — keeping the impl simple here is fine.
+        for buf in bufs {
+            if !buf.is_empty() {
+                return self.as_mut().poll_read(cx, buf);
+            }
         }
-        Pin::new(&mut *self.inner).poll_read_vectored(cx, bufs)
+        Poll::Ready(Ok(0))
     }
 }
 
-impl AsyncWrite for EncryptingSerialIo {
+/// Copy as many bytes as fit from `src` into `dst`, removing them
+/// from the front of `src`. Returns the number copied.
+fn copy_out(src: &mut VecDeque<u8>, dst: &mut [u8]) -> usize {
+    let n = src.len().min(dst.len());
+    for (i, b) in src.drain(..n).enumerate() {
+        dst[i] = b;
+    }
+    n
+}
+
+/// Tiny adapter so [`StreamScanner::drain`] (which wants a
+/// `&mut dyn io::Write`) can write into the consumer's queue.
+struct VecDequeWriter<'a>(&'a mut VecDeque<u8>);
+
+impl io::Write for VecDequeWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.extend(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncWrite for EncryptedSerialIo {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -449,23 +586,62 @@ mod tests {
     use pal_async::timer::PolledTimer;
     use parking_lot::Mutex;
     use std::sync::Arc;
+    use std::collections::VecDeque as TestVecDeque;
     use std::time::Duration;
 
     /// In-memory `SerialIo` backend that captures every byte written
-    /// to it. Reads are never satisfied. Used by the producer tests
-    /// to inspect the wire bytes the encryptor emitted.
+    /// to it AND lets tests inject bytes for the wrapper's read path.
+    /// Used for both producer-only tests (which ignore the read side)
+    /// and consumer-side tests (which inject encrypted records and
+    /// observe the decrypted output coming out of poll_read).
     struct CapturingBackend {
         captured: Arc<Mutex<Vec<u8>>>,
+        inject: Arc<Mutex<TestVecDeque<u8>>>,
+        eof_when_inject_empty: Arc<Mutex<bool>>,
+    }
+
+    /// Handle returned to the test for poking at backend state.
+    #[derive(Clone)]
+    struct BackendCtl {
+        captured: Arc<Mutex<Vec<u8>>>,
+        inject: Arc<Mutex<TestVecDeque<u8>>>,
+        eof_when_inject_empty: Arc<Mutex<bool>>,
+    }
+
+    impl BackendCtl {
+        fn captured_bytes(&self) -> Vec<u8> {
+            self.captured.lock().clone()
+        }
+        /// Append bytes that the next inner `poll_read` should
+        /// deliver upward.
+        fn inject(&self, bytes: &[u8]) {
+            self.inject.lock().extend(bytes);
+        }
+        /// After this is set, when the inject queue is empty, the
+        /// inner `poll_read` returns `Ok(0)` (EOF) instead of
+        /// `Pending`.
+        fn signal_eof(&self) {
+            *self.eof_when_inject_empty.lock() = true;
+        }
     }
 
     impl CapturingBackend {
-        fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        fn new() -> (Self, BackendCtl) {
             let captured = Arc::new(Mutex::new(Vec::new()));
+            let inject = Arc::new(Mutex::new(TestVecDeque::new()));
+            let eof = Arc::new(Mutex::new(false));
+            let backend = Self {
+                captured: captured.clone(),
+                inject: inject.clone(),
+                eof_when_inject_empty: eof.clone(),
+            };
             (
-                Self {
-                    captured: captured.clone(),
+                backend,
+                BackendCtl {
+                    captured,
+                    inject,
+                    eof_when_inject_empty: eof,
                 },
-                captured,
             )
         }
     }
@@ -492,9 +668,20 @@ mod tests {
         fn poll_read(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            _buf: &mut [u8],
+            buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
-            Poll::Pending
+            let mut inject = self.inject.lock();
+            if inject.is_empty() {
+                if *self.eof_when_inject_empty.lock() {
+                    return Poll::Ready(Ok(0));
+                }
+                return Poll::Pending;
+            }
+            let n = inject.len().min(buf.len());
+            for (i, b) in inject.drain(..n).enumerate() {
+                buf[i] = b;
+            }
+            Poll::Ready(Ok(n))
         }
     }
 
@@ -531,13 +718,35 @@ mod tests {
         s
     }
 
-    fn make_wrapper(driver: &DefaultDriver) -> (EncryptingSerialIo, Arc<Mutex<Vec<u8>>>) {
-        let (backend, captured) = CapturingBackend::new();
+    fn make_wrapper(driver: &DefaultDriver) -> (EncryptedSerialIo, Arc<Mutex<Vec<u8>>>) {
+        let (wrapper, ctl) = make_bidi_wrapper(driver);
+        (wrapper, ctl.captured)
+    }
+
+    /// Like [`make_wrapper`] but exposes the full backend control
+    /// handle so tests can also inject bytes for the read path and
+    /// signal EOF.
+    fn make_bidi_wrapper(driver: &DefaultDriver) -> (EncryptedSerialIo, BackendCtl) {
+        let (backend, ctl) = CapturingBackend::new();
         let timer = PolledTimer::new(driver);
         let session_id = test_session_id();
-        let wrapper =
-            EncryptingSerialIo::new(Box::new(backend), test_aes_key(), session_id, timer);
-        (wrapper, captured)
+        let gks = Arc::new(test_gks());
+        let wrapper = EncryptedSerialIo::new(
+            Box::new(backend),
+            test_aes_key(),
+            session_id,
+            timer,
+            gks,
+        );
+        (wrapper, ctl)
+    }
+
+    fn test_gks() -> GksKeyMaterial {
+        let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        GksKeyMaterial(buf)
     }
 
     fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
@@ -722,6 +931,221 @@ mod tests {
             bytes.iter().filter(|&&b| b == b'\n').count(),
             0,
             "wire framing must not contain a newline byte between records"
+        );
+    }
+
+    // ---- Consumer (read-side) tests ----------------------------------
+
+    use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
+    use openhcl_serial_console_crypto::consts::SESSION_ID_LEN as TEST_SESSION_ID_LEN;
+    use openhcl_serial_console_crypto::consts::NONCE_LEN as TEST_NONCE_LEN;
+    use openhcl_serial_console_crypto::crypto::derive_aes_key as test_derive_aes_key;
+    use openhcl_serial_console_crypto::crypto::encrypt as test_encrypt;
+    use openhcl_serial_console_crypto::format::Record as TestRecord;
+    use futures::AsyncReadExt;
+
+    /// Build one wire-format record under the test GKS.
+    fn build_inbound_record(
+        plaintext: &[u8],
+        session_id: [u8; TEST_SESSION_ID_LEN],
+        seq: u64,
+    ) -> Vec<u8> {
+        let aes_key: [u8; AES_KEY_LEN] = test_derive_aes_key(&test_gks(), &session_id).unwrap();
+        let mut nonce = [0u8; TEST_NONCE_LEN];
+        for (i, b) in nonce.iter_mut().enumerate() {
+            *b = ((i as u64 + seq) & 0xff) as u8;
+        }
+        let (ciphertext, tag) =
+            test_encrypt(&aes_key, &session_id, seq, &nonce, plaintext).unwrap();
+        let record = TestRecord {
+            session_id,
+            seq,
+            nonce,
+            ciphertext,
+            tag,
+        };
+        record.encode_to_string().into_bytes()
+    }
+
+    fn host_session_id() -> [u8; TEST_SESSION_ID_LEN] {
+        // Distinct from `test_session_id()` (the producer's), so the
+        // two directions are unambiguously different sessions.
+        let mut s = [0u8; TEST_SESSION_ID_LEN];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = ((i + 0xa0) & 0xff) as u8;
+        }
+        s
+    }
+
+    #[async_test]
+    async fn read_decrypts_single_record(driver: DefaultDriver) {
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        let sid = host_session_id();
+        ctl.inject(&build_inbound_record(b"hello\n", sid, 0));
+        ctl.signal_eof(); // tell the wrapper there's no more to come
+
+        let mut out = Vec::new();
+        wrapper.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello\n");
+    }
+
+    #[async_test]
+    async fn read_decrypts_multiple_back_to_back_records(driver: DefaultDriver) {
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        let sid = host_session_id();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&build_inbound_record(b"one\n", sid, 0));
+        wire.extend_from_slice(&build_inbound_record(b"two\n", sid, 1));
+        wire.extend_from_slice(&build_inbound_record(b"three\n", sid, 2));
+        ctl.inject(&wire);
+        ctl.signal_eof();
+
+        let mut out = Vec::new();
+        wrapper.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"one\ntwo\nthree\n");
+    }
+
+    #[async_test]
+    async fn read_passes_through_plaintext(driver: DefaultDriver) {
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        ctl.inject(b"raw plaintext from a non-encrypted client\n");
+        ctl.signal_eof();
+
+        let mut out = Vec::new();
+        wrapper.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"raw plaintext from a non-encrypted client\n");
+    }
+
+    #[async_test]
+    async fn read_handles_mixed_plaintext_and_records(driver: DefaultDriver) {
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        let sid = host_session_id();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"prefix ");
+        wire.extend_from_slice(&build_inbound_record(b"middle", sid, 0));
+        wire.extend_from_slice(b" suffix\n");
+        ctl.inject(&wire);
+        ctl.signal_eof();
+
+        let mut out = Vec::new();
+        wrapper.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"prefix middle suffix\n");
+    }
+
+    #[async_test]
+    async fn read_handles_partial_sentinel_across_inner_reads(driver: DefaultDriver) {
+        // The first inject delivers the opener but no closing `]]`;
+        // the second inject delivers the rest. The wrapper must
+        // stitch them without dropping bytes or hanging.
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        let sid = host_session_id();
+        let full = build_inbound_record(b"split\n", sid, 0);
+        let split = full.len() / 2;
+        ctl.inject(&full[..split]);
+
+        // Drive a single poll_read to consume the partial. The
+        // wrapper should NOT emit anything yet (whole record needed).
+        // Then inject the rest and read to EOF.
+        // Use AsyncReadExt::read which gives us one fill per call.
+        let mut buf = [0u8; 64];
+        let n = futures::future::poll_fn(|cx| {
+            // Manually drive one poll_read so we can observe Pending
+            // without stalling the test.
+            match Pin::new(&mut wrapper).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(n)) => Poll::Ready(Some(n)),
+                Poll::Ready(Err(e)) => panic!("poll_read error: {e}"),
+                Poll::Pending => Poll::Ready(None),
+            }
+        })
+        .await;
+        assert_eq!(n, None, "partial sentinel must not yield plaintext yet");
+
+        ctl.inject(&full[split..]);
+        ctl.signal_eof();
+
+        let mut out = Vec::new();
+        wrapper.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"split\n");
+    }
+
+    #[async_test]
+    async fn read_then_write_independent_sessions(driver: DefaultDriver) {
+        // Confirm the producer (write) session and the consumer
+        // (read) session are kept separate: a write of 300 bytes
+        // produces one outbound record under the producer's
+        // session_id, while a record arriving from a different
+        // session_id decrypts cleanly on the read side.
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+
+        let host_sid = host_session_id();
+        ctl.inject(&build_inbound_record(b"in\n", host_sid, 0));
+
+        // Drive the inbound read; needs at least one poll cycle.
+        let mut buf = [0u8; 64];
+        let n = wrapper.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"in\n");
+
+        // Now exercise the producer side.
+        wrapper.write_all(&[b'X'; 300]).await.unwrap();
+        let outbound = ctl.captured_bytes();
+        assert_eq!(
+            count_subseq(&outbound, SENTINEL_OPEN),
+            1,
+            "one outbound record from the 300-byte write"
+        );
+
+        // The producer's session_id is `test_session_id()` (the
+        // one passed to make_bidi_wrapper); the consumer cached
+        // `host_sid`. They must be different.
+        assert_ne!(test_session_id(), host_sid);
+    }
+
+    #[async_test]
+    async fn read_eof_flushes_partial_sentinel_as_passthrough(driver: DefaultDriver) {
+        // Inject only the opener bytes, then signal EOF. The
+        // wrapper's at_eof drain should pass them through verbatim
+        // so a buggy or aborted host doesn't cause silent data loss.
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        ctl.inject(b"hello [[OHENC v1 ");
+        ctl.signal_eof();
+
+        let mut out = Vec::new();
+        wrapper.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello [[OHENC v1 ");
+    }
+
+    #[async_test]
+    async fn read_drains_producer_output(driver: DefaultDriver) {
+        // A sub-threshold write arms the producer's idle timer
+        // without flushing immediately. A subsequent poll_read must
+        // pick that up via poll_drain_output and push the encrypted
+        // record onto the wire — independent of whether any inbound
+        // bytes are available.
+        let (mut wrapper, ctl) = make_bidi_wrapper(&driver);
+        wrapper.write_all(b"partial").await.unwrap();
+        assert_eq!(ctl.captured_bytes().len(), 0);
+
+        // Sleep past the idle deadline.
+        let mut sleeper = PolledTimer::new(&driver);
+        sleeper
+            .sleep(PRODUCER_IDLE_FLUSH + Duration::from_millis(20))
+            .await;
+
+        // Drive one poll_read with no inbound data. The inner has
+        // nothing to deliver (returns Pending) but the wrapper
+        // should still flush + drain the producer side.
+        let mut buf = [0u8; 64];
+        let _ = futures::future::poll_fn(|cx| {
+            let _ = Pin::new(&mut wrapper).poll_read(cx, &mut buf);
+            Poll::Ready(())
+        })
+        .await;
+
+        let captured = ctl.captured_bytes();
+        assert_eq!(
+            count_subseq(&captured, SENTINEL_OPEN),
+            1,
+            "poll_read must drive the producer drain so timer-flushed bytes reach the wire",
         );
     }
 }
