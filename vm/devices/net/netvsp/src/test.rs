@@ -32,6 +32,7 @@ use net_backend::EndpointAction;
 use net_backend::MultiQueueSupport;
 use net_backend::Queue as NetQueue;
 use net_backend::QueueConfig;
+use net_backend::RxBufferSegment;
 use net_backend::TxError;
 use net_backend::TxOffloadSupport;
 use net_backend::null::NullEndpoint;
@@ -200,6 +201,7 @@ impl TestNicEndpoint {
             tcp: true,
             udp: true,
             tso: true,
+            uso: false,
         };
         let multiqueue_support = MultiQueueSupport {
             max_queues: u16::MAX,
@@ -228,7 +230,7 @@ impl net_backend::Endpoint for TestNicEndpoint {
 
     async fn get_queues(
         &mut self,
-        config: Vec<QueueConfig<'_>>,
+        config: Vec<QueueConfig>,
         _rss: Option<&net_backend::RssConfig<'_>>,
         queues: &mut Vec<Box<dyn net_backend::Queue>>,
     ) -> anyhow::Result<()> {
@@ -332,30 +334,29 @@ impl net_backend::Endpoint for TestNicEndpoint {
 #[derive(InspectMut)]
 struct TestNicQueue {
     #[inspect(skip)]
-    pool: Box<dyn BufferAccess>,
-    #[inspect(skip)]
     rx_ids: VecDeque<RxId>,
     #[inspect(skip)]
     rx: mesh::Receiver<Vec<u8>>,
     next_rx_packet: Option<Vec<u8>>,
     sync_tx: bool,
+    #[inspect(skip)]
+    scratch_segments: Vec<RxBufferSegment>,
 }
 
 impl TestNicQueue {
-    pub fn new(config: QueueConfig<'_>, rx: mesh::Receiver<Vec<u8>>, sync_tx: bool) -> Self {
-        let rx_ids = config.initial_rx.iter().copied().collect();
+    pub fn new(_config: QueueConfig, rx: mesh::Receiver<Vec<u8>>, sync_tx: bool) -> Self {
         Self {
-            pool: config.pool,
-            rx_ids,
+            rx_ids: VecDeque::new(),
             rx,
             next_rx_packet: None,
             sync_tx,
+            scratch_segments: Vec::new(),
         }
     }
 }
 
 impl NetQueue for TestNicQueue {
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>, _pool: &mut dyn BufferAccess) -> Poll<()> {
         if self.rx_ids.is_empty() {
             return Poll::Pending;
         }
@@ -374,11 +375,15 @@ impl NetQueue for TestNicQueue {
         Poll::Ready(())
     }
 
-    fn rx_avail(&mut self, done: &[RxId]) {
+    fn rx_avail(&mut self, _pool: &mut dyn BufferAccess, done: &[RxId]) {
         self.rx_ids.extend(done);
     }
 
-    fn rx_poll(&mut self, packets: &mut [RxId]) -> anyhow::Result<usize> {
+    fn rx_poll(
+        &mut self,
+        pool: &mut dyn BufferAccess,
+        packets: &mut [RxId],
+    ) -> anyhow::Result<usize> {
         if packets.is_empty() || self.rx_ids.is_empty() {
             return Ok(0);
         }
@@ -393,8 +398,10 @@ impl NetQueue for TestNicQueue {
             let rx_id = self.rx_ids.pop_front().unwrap();
             tracing::info!(rx_id = rx_id.0, ?packet, "returning packet on receive path");
             let mut packet = &packet[..];
-            let guest_memory = self.pool.guest_memory().clone();
-            for seg in self.pool.guest_addresses(rx_id).iter() {
+            self.scratch_segments.clear();
+            pool.push_guest_addresses(rx_id, &mut self.scratch_segments);
+            let guest_memory = pool.guest_memory();
+            for seg in &self.scratch_segments {
                 // N.B. The packet data is written after the implicit header,
                 //      which is 256 bytes long. The header can be written with
                 //      self.pool.write_header(...) if desired.
@@ -415,16 +422,20 @@ impl NetQueue for TestNicQueue {
         }
     }
 
-    fn tx_avail(&mut self, packets: &[TxSegment]) -> anyhow::Result<(bool, usize)> {
+    fn tx_avail(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        packets: &[TxSegment],
+    ) -> anyhow::Result<(bool, usize)> {
         Ok((self.sync_tx, packets.len()))
     }
 
-    fn tx_poll(&mut self, _done: &mut [TxId]) -> Result<usize, TxError> {
+    fn tx_poll(
+        &mut self,
+        _pool: &mut dyn BufferAccess,
+        _done: &mut [TxId],
+    ) -> Result<usize, TxError> {
         Ok(0)
-    }
-
-    fn buffer_access(&mut self) -> Option<&mut dyn BufferAccess> {
-        None
     }
 }
 
@@ -5542,6 +5553,148 @@ async fn rndis_send_lso_packet(driver: DefaultDriver) {
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
+}
+
+#[async_test]
+async fn rndis_send_lso_packet_invalid_tcp_header_offset(driver: DefaultDriver) {
+    let endpoint_state = TestNicEndpointState::new();
+    let endpoint = TestNicEndpoint::new(Some(endpoint_state.clone()));
+    let builder = Nic::builder();
+    let nic = builder.build(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        Guid::new_random(),
+        Box::new(endpoint),
+        [1, 2, 3, 4, 5, 6].into(),
+        0,
+    );
+
+    let mut nic = TestNicDevice::new_with_nic(&driver, nic).await;
+    nic.start_vmbus_channel();
+    let mut channel = nic.connect_vmbus_channel().await;
+    channel
+        .initialize(0, protocol::NdisConfigCapabilities::new())
+        .await;
+    channel
+        .send_rndis_control_message(
+            rndisprot::MESSAGE_TYPE_INITIALIZE_MSG,
+            rndisprot::InitializeRequest {
+                request_id: 123,
+                major_version: rndisprot::MAJOR_VERSION,
+                minor_version: rndisprot::MINOR_VERSION,
+                max_transfer_size: 0,
+            },
+            &[],
+        )
+        .await;
+
+    let initialize_complete: rndisprot::InitializeComplete = channel
+        .read_rndis_control_message(rndisprot::MESSAGE_TYPE_INITIALIZE_CMPLT)
+        .await
+        .unwrap();
+    assert_eq!(initialize_complete.request_id, 123);
+    assert_eq!(initialize_complete.status, rndisprot::STATUS_SUCCESS);
+
+    assert_eq!(endpoint_state.lock().stop_endpoint_counter, 1);
+
+    // Send an LSO packet with tcp_header_offset pointing beyond the packet
+    // data so that the Data Offset byte (byte 12 of the TCP header) cannot
+    // be read. This should be rejected with Status::FAILURE.
+    let data = vec![0xCC; 60];
+    let mem = channel.nic.mock_vmbus.memory.clone();
+    let gpadl_view = channel
+        .gpadl_map
+        .clone()
+        .view()
+        .map(channel.send_buf_id)
+        .unwrap();
+    let mut buf_writer = PagedRanges::new(&*gpadl_view).writer(&mem);
+
+    let per_packet_info_offset = size_of::<rndisprot::Packet>() as u32;
+    let per_packet_info_length =
+        size_of::<rndisprot::PerPacketInfo>() as u32 + size_of::<rndisprot::TcpLsoInfo>() as u32;
+    let message_length = size_of::<rndisprot::MessageHeader>()
+        + size_of::<rndisprot::Packet>()
+        + per_packet_info_length as usize
+        + data.len();
+
+    buf_writer
+        .write(
+            rndisprot::MessageHeader {
+                message_type: rndisprot::MESSAGE_TYPE_PACKET_MSG,
+                message_length: message_length as u32,
+            }
+            .as_bytes(),
+        )
+        .unwrap();
+
+    buf_writer
+        .write(
+            rndisprot::Packet {
+                data_offset: per_packet_info_offset + per_packet_info_length,
+                data_length: data.len() as u32,
+                oob_data_offset: 0,
+                oob_data_length: 0,
+                num_oob_data_elements: 0,
+                per_packet_info_offset,
+                per_packet_info_length,
+                vc_handle: 0,
+                reserved: 0,
+            }
+            .as_bytes(),
+        )
+        .unwrap();
+
+    // tcp_header_offset = 100 means the TCP header starts at byte 100, so the
+    // Data Offset nibble is at byte 112. With only 60 bytes of data this is
+    // out of bounds.
+    const INVALID_TCP_HEADER_OFFSET: u16 = 100;
+    const NORMAL_MTU: u32 = 1460;
+    let lso_info = rndisprot::TcpLsoInfo(NORMAL_MTU | ((INVALID_TCP_HEADER_OFFSET as u32) << 20));
+
+    buf_writer
+        .write(
+            rndisprot::PerPacketInfo {
+                size: size_of::<rndisprot::PerPacketInfo>() as u32
+                    + size_of::<rndisprot::TcpLsoInfo>() as u32,
+                typ: rndisprot::PPI_LSO,
+                per_packet_information_offset: size_of::<rndisprot::PerPacketInfo>() as u32,
+            }
+            .as_bytes(),
+        )
+        .unwrap();
+    buf_writer.write(lso_info.as_bytes()).unwrap();
+    buf_writer.write(data.as_bytes()).unwrap();
+
+    let message = NvspMessage {
+        header: protocol::MessageHeader {
+            message_type: protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET,
+        },
+        data: protocol::Message1SendRndisPacket {
+            channel_type: protocol::DATA_CHANNEL_TYPE,
+            send_buffer_section_index: 0xffffffff,
+            send_buffer_section_size: 0,
+        },
+        padding: &[],
+    };
+
+    let gpadl_map_view = channel
+        .gpadl_map
+        .clone()
+        .view()
+        .map(channel.send_buf_id)
+        .unwrap();
+    let gpa_range = gpadl_map_view.first().unwrap().subrange(0, message_length);
+    channel
+        .write(OutgoingPacket {
+            transaction_id: channel.transaction_id,
+            packet_type: OutgoingPacketType::GpaDirect(&[gpa_range]),
+            payload: &message.payload(),
+        })
+        .await;
+    channel.transaction_id += 1;
+
+    let completion = channel.read_rndis_packet_complete_message().await.unwrap();
+    assert_eq!(completion.status, protocol::Status::FAILURE);
 }
 
 #[async_test]

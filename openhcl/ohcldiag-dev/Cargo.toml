@@ -8,12 +8,12 @@ rust-version.workspace = true
 
 [dependencies]
 diag_client.workspace = true
+openhcl_serial_console_crypto.workspace = true
 
 clap_dyn_complete.workspace = true
 inspect.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
-pal.workspace = true
 term.workspace = true
 
 anyhow.workspace = true
@@ -23,10 +23,13 @@ fs-err.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
 kmsg.workspace = true
-socket2.workspace = true
 thiserror.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 unicycle.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+pal.workspace = true
+socket2.workspace = true
 
 [lints]
 workspace = true
