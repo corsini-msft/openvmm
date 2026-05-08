@@ -25,6 +25,7 @@ register_static_resolvers! {
     tpm::resources::GetTpmLoggerResolver,
 }
 
+pub mod encrypted_kmsg;
 pub mod encrypted_serial;
 pub struct EmuplatServicing {
     pub rtc_local_clock: Arc<Mutex<local_clock::UnderhillLocalClock>>,

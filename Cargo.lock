@@ -5016,6 +5016,7 @@ dependencies = [
  "inspect",
  "kmsg",
  "mesh",
+ "openhcl_serial_console_crypto",
  "pal",
  "pal_async",
  "socket2",

@@ -3,6 +3,8 @@
 
 //! Wire-format constants for the encrypted serial console.
 
+use std::time::Duration;
+
 /// Length in bytes of the random per-session identifier in each
 /// record.
 pub const SESSION_ID_LEN: usize = 16;
@@ -61,3 +63,23 @@ pub const AAD_DOMAIN: &[u8] = b"OpenHCL encrypted serial console v1 AES-256-GCM\
 /// Context label for the SP800-108 KBKDF derivation that turns the
 /// 2048-byte GKS into a per-session AES-256-GCM key.
 pub const KDF_LABEL: &[u8] = b"OpenHCL encrypted serial console v1 AES-256-GCM key";
+
+/// Soft size threshold for producer flushes.
+///
+/// When the encrypting wrapper's pending plaintext reaches this size
+/// it encrypts and emits a record immediately, without waiting for
+/// the idle timer. 256 bytes amortises the per-record framing
+/// overhead (~100 bytes for nonce + tag + base64 + sentinel) while
+/// keeping records small enough to ship promptly under interactive
+/// load. Mirrors typical TLS record sizing.
+pub const PRODUCER_SOFT_FLUSH_BYTES: usize = 256;
+
+/// Idle flush timeout for the producer.
+///
+/// If no new bytes arrive for this duration after the buffer became
+/// non-empty, any pending plaintext is flushed. 50 ms is below human
+/// perception, well above scheduler granularity, and matches the
+/// output-coalescing intervals used by tmux/screen and the GDB
+/// remote serial protocol. Bounds the worst-case latency between a
+/// producer write and the corresponding wire record.
+pub const PRODUCER_IDLE_FLUSH: Duration = Duration::from_millis(50);

@@ -103,18 +103,43 @@ struct StreamKeyArgs {
     /// Plaintext VMGS file from which to read FileId::GUEST_SECRET_KEY.
     #[arg(short, long, value_name = "PATH")]
     vmgs: Option<std::path::PathBuf>,
+
+    /// Increase log verbosity. Pass `--verbose` for debug-level
+    /// (per fill_buf, per record, per passthrough). Pass twice
+    /// (`--verbose --verbose`) for trace-level (also includes
+    /// hex dumps of input bytes).
+    ///
+    /// Equivalent to setting `RUST_LOG=decrypt_serial=debug` (or
+    /// `=trace`). Logs are written to stderr; decrypted output
+    /// continues to go to stdout, so this is safe to leave on
+    /// while piping output to a file.
+    #[arg(long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+
+    // If a stream subcommand was passed `-v` / `-vv`, raise the
+    // default log level before the env filter is built. An explicit
+    // `RUST_LOG=...` still wins.
+    let default_filter = match &cli.command {
+        Commands::StreamDecrypt(args) | Commands::StreamEncrypt(args) => match args.verbose {
+            0 => "info",
+            1 => "decrypt_serial=debug,info",
+            _ => "decrypt_serial=trace,info",
+        },
+        Commands::Decrypt(_) => "info",
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     match cli.command {
         Commands::Decrypt(args) => run_decrypt(&args),
         Commands::StreamDecrypt(args) => run_stream_decrypt(&args),
