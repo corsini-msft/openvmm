@@ -1768,6 +1768,7 @@ dependencies = [
  "pal_async",
  "tempfile",
  "term",
+ "tpm_protocol",
  "tracing",
  "tracing-subscriber",
  "vmgs",

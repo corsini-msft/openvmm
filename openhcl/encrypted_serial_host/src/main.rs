@@ -13,6 +13,7 @@
 mod bridge;
 mod decrypt_file;
 mod key_source;
+mod provision;
 mod stream;
 
 use clap::ArgGroup;
@@ -43,6 +44,11 @@ enum Commands {
     /// encrypts what the user types on stdin back to the pipe.
     /// Each direction runs its own encryption session.
     Bridge(BridgeArgs),
+    /// Developer-only: seed `FileId::GUEST_SECRET_KEY` in a plaintext
+    /// VMGS file with random or caller-supplied bytes. Not a
+    /// production provisioning tool; see the module docs in
+    /// `provision.rs`.
+    ProvisionGsk(ProvisionGskArgs),
     /// Print build info (git SHA, branch, wire-format version) and exit.
     /// Useful for verifying that a freshly-built binary actually contains
     /// a specific change rather than a stale cached binary.
@@ -73,6 +79,27 @@ struct DecryptArgs {
     /// Treat the first malformed sentinel or decrypt failure as fatal.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(
+    group = ArgGroup::new("provision_source").required(true).args(["from_blob"]),
+)]
+struct ProvisionGskArgs {
+    /// Plaintext VMGS file to provision. Must be opened read-write
+    /// and must not be encrypted.
+    #[arg(short, long, value_name = "PATH")]
+    vmgs: std::path::PathBuf,
+
+    /// Read a TPM2_Import duplicate blob (no inner wrapping key)
+    /// from a file. Validated against the same parser the vTPM
+    /// uses at first boot before being written.
+    #[arg(long, value_name = "PATH")]
+    from_blob: Option<std::path::PathBuf>,
+
+    /// Overwrite an existing FileId::GUEST_SECRET_KEY entry.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -164,7 +191,7 @@ fn main() -> std::process::ExitCode {
             1 => "encrypted_serial=debug,info",
             _ => "encrypted_serial=trace,info",
         },
-        Commands::DecryptFile(_) | Commands::Version => "info",
+        Commands::DecryptFile(_) | Commands::ProvisionGsk(_) | Commands::Version => "info",
     };
 
     tracing_subscriber::fmt()
@@ -180,6 +207,7 @@ fn main() -> std::process::ExitCode {
         Commands::DecryptStream(args) => run_decrypt_stream(&args),
         Commands::EncryptStream(args) => run_encrypt_stream(&args),
         Commands::Bridge(args) => run_bridge(&args),
+        Commands::ProvisionGsk(args) => run_provision_gsk(&args),
         Commands::Version => run_version(),
     }
 }
@@ -307,6 +335,27 @@ fn run_bridge(args: &BridgeArgs) -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("encrypted-serial bridge: {err:#}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+fn run_provision_gsk(args: &ProvisionGskArgs) -> std::process::ExitCode {
+    let source = if let Some(p) = args.from_blob.as_ref() {
+        provision::ProvisionSource::FromBlob(p.clone())
+    } else {
+        unreachable!("clap ArgGroup ensures --from-blob is set")
+    };
+    let result = pal_async::DefaultPool::run_with(async |_| {
+        provision::provision(&args.vmgs, source, args.force).await
+    });
+    match result {
+        Ok(()) => {
+            tracing::info!("encrypted-serial provision-gsk: wrote GUEST_SECRET_KEY");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("encrypted-serial provision-gsk: {err:#}");
             std::process::ExitCode::from(1)
         }
     }

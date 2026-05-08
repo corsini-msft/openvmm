@@ -15,6 +15,7 @@ build_info.workspace = true
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
 term.workspace = true
+tpm_protocol.workspace = true
 
 disk_backend.workspace = true
 disk_vhd1.workspace = true
@@ -24,6 +25,7 @@ mesh.workspace = true
 pal_async.workspace = true
 vmgs.workspace = true
 vmgs_format.workspace = true
+zerocopy.workspace = true
 
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
@@ -34,7 +36,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 disklayer_ram.workspace = true
 tempfile.workspace = true
-zerocopy.workspace = true
 
 [build-dependencies]
 build_rs_git_info.workspace = true
