@@ -15,9 +15,9 @@
 //! <6>underhill_core::worker: [[OHENC v1 abc123...]]
 //! ```
 //!
-//! Decrypt by piping through `decrypt-serial`:
+//! Decrypt by piping through `encrypted-serial`:
 //! ```text
-//! ohcldiag-dev.exe MyVM kmsg -f | decrypt-serial.exe stream-decrypt --key key.bin
+//! ohcldiag-dev.exe MyVM kmsg -f | encrypted-serial.exe decrypt-stream --key key.bin
 //! ```
 
 use openhcl_serial_console_crypto::consts::MAX_PLAINTEXT_LEN;

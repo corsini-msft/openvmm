@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! `decrypt-serial` --- decrypt encrypted serial console output
-//! emitted by OpenHCL VTL2.
+//! `encrypted-serial` --- encrypt and decrypt serial console output
+//! and input for OpenHCL VTL2's encrypted serial console.
 //!
-//! See `Guide/src/reference/openhcl/diag/decrypt_serial.md` and the
+//! See `Guide/src/reference/openhcl/diag/encrypted_serial.md` and the
 //! `openhcl_serial_console_crypto` crate for the wire-format
 //! definition.
 
 #![forbid(unsafe_code)]
 
-mod decrypt;
+mod decrypt_file;
 mod key_source;
 mod stream;
 
@@ -18,9 +18,9 @@ use clap::ArgGroup;
 use clap::Parser;
 use clap::Subcommand;
 
-/// Decrypt (or encrypt) serial console output for OpenHCL VTL2.
+/// Encrypt and decrypt serial console traffic for OpenHCL VTL2.
 #[derive(Parser, Debug)]
-#[command(name = "decrypt-serial")]
+#[command(name = "encrypted-serial")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -28,14 +28,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Decrypt a captured serial file (existing behavior).
-    Decrypt(DecryptArgs),
+    /// Decrypt a captured serial file.
+    DecryptFile(DecryptArgs),
     /// Stream-decrypt from stdin, writing plaintext to stdout.
-    /// Reads line-by-line for live pipe usage.
-    StreamDecrypt(StreamKeyArgs),
+    /// Reads bytes from a live pipe.
+    DecryptStream(StreamKeyArgs),
     /// Stream-encrypt from stdin, writing encrypted records to stdout.
     /// Reads line-by-line for live pipe usage.
-    StreamEncrypt(StreamKeyArgs),
+    EncryptStream(StreamKeyArgs),
     /// Print build info (git SHA, branch, wire-format version) and exit.
     /// Useful for verifying that a freshly-built binary actually contains
     /// a specific change rather than a stale cached binary.
@@ -86,7 +86,7 @@ struct StreamKeyArgs {
     /// (`--verbose --verbose`) for trace-level (also includes
     /// hex dumps of input bytes).
     ///
-    /// Equivalent to setting `RUST_LOG=decrypt_serial=debug` (or
+    /// Equivalent to setting `RUST_LOG=encrypted_serial=debug` (or
     /// `=trace`). Logs are written to stderr; decrypted output
     /// continues to go to stdout, so this is safe to leave on
     /// while piping output to a file.
@@ -97,16 +97,16 @@ struct StreamKeyArgs {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
-    // If a stream subcommand was passed `-v` / `-vv`, raise the
+    // If a stream subcommand was passed `--verbose`, raise the
     // default log level before the env filter is built. An explicit
     // `RUST_LOG=...` still wins.
     let default_filter = match &cli.command {
-        Commands::StreamDecrypt(args) | Commands::StreamEncrypt(args) => match args.verbose {
+        Commands::DecryptStream(args) | Commands::EncryptStream(args) => match args.verbose {
             0 => "info",
-            1 => "decrypt_serial=debug,info",
-            _ => "decrypt_serial=trace,info",
+            1 => "encrypted_serial=debug,info",
+            _ => "encrypted_serial=trace,info",
         },
-        Commands::Decrypt(_) | Commands::Version => "info",
+        Commands::DecryptFile(_) | Commands::Version => "info",
     };
 
     tracing_subscriber::fmt()
@@ -118,9 +118,9 @@ fn main() -> std::process::ExitCode {
         .init();
 
     match cli.command {
-        Commands::Decrypt(args) => run_decrypt(&args),
-        Commands::StreamDecrypt(args) => run_stream_decrypt(&args),
-        Commands::StreamEncrypt(args) => run_stream_encrypt(&args),
+        Commands::DecryptFile(args) => run_decrypt_file(&args),
+        Commands::DecryptStream(args) => run_decrypt_stream(&args),
+        Commands::EncryptStream(args) => run_encrypt_stream(&args),
         Commands::Version => run_version(),
     }
 }
@@ -137,12 +137,12 @@ const FEATURE_MARKER: &str = "v1-back-to-back-no-lf";
 
 fn run_version() -> std::process::ExitCode {
     let info = build_info::get();
-    println!("decrypt-serial");
+    println!("encrypted-serial");
     println!("  package version: {}", env!("CARGO_PKG_VERSION"));
     println!(
         "  git sha:         {}",
         if info.scm_revision().is_empty() {
-            "(unknown — built outside a git checkout?)"
+            "(unknown - built outside a git checkout?)"
         } else {
             info.scm_revision()
         }
@@ -173,22 +173,22 @@ fn resolve_key(
         .map_err(Into::into)
 }
 
-fn run_decrypt(args: &DecryptArgs) -> std::process::ExitCode {
+fn run_decrypt_file(args: &DecryptArgs) -> std::process::ExitCode {
     use anyhow::Context as _;
     use std::io::Write as _;
 
-    let result = (|| -> anyhow::Result<decrypt::DecryptStats> {
+    let result = (|| -> anyhow::Result<decrypt_file::DecryptStats> {
         let input = fs_err::read(&args.input).context("reading --input file")?;
         let gks = resolve_key(&args.key, &args.vmgs).context("resolving key source")?;
         let stats = if let Some(out_path) = args.output.as_ref() {
             let mut out = fs_err::File::create(out_path).context("creating --output file")?;
-            let stats = decrypt::run(&input, &mut out, &gks, args.strict)?;
+            let stats = decrypt_file::run(&input, &mut out, &gks, args.strict)?;
             out.flush().context("flushing --output file")?;
             stats
         } else {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            let stats = decrypt::run(&input, &mut out, &gks, args.strict)?;
+            let stats = decrypt_file::run(&input, &mut out, &gks, args.strict)?;
             out.flush().context("flushing stdout")?;
             stats
         };
@@ -201,7 +201,7 @@ fn run_decrypt(args: &DecryptArgs) -> std::process::ExitCode {
                 records_ok = stats.records_ok,
                 records_failed = stats.records_failed,
                 sessions = stats.sessions_observed,
-                "decrypt-serial finished",
+                "encrypted-serial decrypt-file finished",
             );
             if args.strict && stats.records_failed > 0 {
                 std::process::ExitCode::from(1)
@@ -210,28 +210,28 @@ fn run_decrypt(args: &DecryptArgs) -> std::process::ExitCode {
             }
         }
         Err(err) => {
-            tracing::error!(error = ?err, "decrypt-serial failed");
-            eprintln!("decrypt-serial: {err:#}");
+            tracing::error!(error = ?err, "encrypted-serial decrypt-file failed");
+            eprintln!("encrypted-serial: {err:#}");
             std::process::ExitCode::from(1)
         }
     }
 }
 
-fn run_stream_decrypt(args: &StreamKeyArgs) -> std::process::ExitCode {
+fn run_decrypt_stream(args: &StreamKeyArgs) -> std::process::ExitCode {
     match stream::stream_decrypt(&args.key, &args.vmgs) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("decrypt-serial stream-decrypt: {err:#}");
+            eprintln!("encrypted-serial decrypt-stream: {err:#}");
             std::process::ExitCode::from(1)
         }
     }
 }
 
-fn run_stream_encrypt(args: &StreamKeyArgs) -> std::process::ExitCode {
+fn run_encrypt_stream(args: &StreamKeyArgs) -> std::process::ExitCode {
     match stream::stream_encrypt(&args.key, &args.vmgs) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("decrypt-serial stream-encrypt: {err:#}");
+            eprintln!("encrypted-serial encrypt-stream: {err:#}");
             std::process::ExitCode::from(1)
         }
     }

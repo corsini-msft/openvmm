@@ -3,12 +3,12 @@
 
 //! Streaming encrypt/decrypt modes for live pipe usage.
 //!
-//! `stream-encrypt` reads plaintext lines from stdin and writes
+//! `encrypt-stream` reads plaintext lines from stdin and writes
 //! `[[OHENC v1 ...]]` records back-to-back to stdout. There is no
 //! delimiter between adjacent records — `]]` already terminates each
 //! one unambiguously.
 //!
-//! `stream-decrypt` reads from stdin (which may contain a mix of
+//! `decrypt-stream` reads from stdin (which may contain a mix of
 //! plaintext and `[[OHENC v1 ...]]` records) and writes decrypted
 //! plaintext to stdout. Decoding is byte-stream-based and does not
 //! depend on any in-band delimiter (newlines included): the scanner
@@ -18,33 +18,25 @@
 //! Together, two instances can form a round-trip pipe:
 //!
 //! ```text
-//! echo "hello" | decrypt-serial stream-encrypt --key k.bin \
-//!     | decrypt-serial stream-decrypt --key k.bin
+//! echo "hello" | encrypted-serial encrypt-stream --key k.bin \
+//!     | encrypted-serial decrypt-stream --key k.bin
 //! ```
 
 use anyhow::Context;
-use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
 use openhcl_serial_console_crypto::consts::MAX_PLAINTEXT_LEN;
-use openhcl_serial_console_crypto::consts::MAX_SENTINEL_BASE64_LEN;
 use openhcl_serial_console_crypto::consts::NONCE_LEN;
-use openhcl_serial_console_crypto::consts::SENTINEL_CLOSE;
-use openhcl_serial_console_crypto::consts::SENTINEL_OPEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
 use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
-use openhcl_serial_console_crypto::format::SentinelError;
-use openhcl_serial_console_crypto::format::SentinelMatch;
-use openhcl_serial_console_crypto::format::find_next_sentinel;
-use std::collections::HashMap;
+use openhcl_serial_console_crypto::stream::StreamScanner;
 use std::io::BufRead;
 use std::io::Write;
 use std::path::PathBuf;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
-use tracing::warn;
 
 /// Read plaintext from stdin, encrypt each line, and write
 /// `[[OHENC v1 ...]]` records to stdout.
@@ -55,7 +47,7 @@ pub fn stream_encrypt(key: &Option<PathBuf>, vmgs: &Option<PathBuf>) -> anyhow::
     stream_encrypt_io(&gks, &mut stdin.lock(), &mut stdout.lock())
 }
 
-/// Inner implementation of `stream-encrypt` that takes generic IO
+/// Inner implementation of `encrypt-stream` that takes generic IO
 /// handles, for testability.
 fn stream_encrypt_io<R: BufRead, W: Write>(
     gks: &GksKeyMaterial,
@@ -76,7 +68,7 @@ fn stream_encrypt_io<R: BufRead, W: Write>(
         // the encrypted plaintext is self-terminating — that matches
         // the in-VM producer's contract (each encrypted chunk
         // includes the original line terminator) and lets
-        // `stream-decrypt` reproduce the line break without
+        // `decrypt-stream` reproduce the line break without
         // synthesizing one.
         let mut plaintext = line.into_bytes();
         plaintext.push(b'\n');
@@ -118,249 +110,75 @@ pub fn stream_decrypt(key: &Option<PathBuf>, vmgs: &Option<PathBuf>) -> anyhow::
     stream_decrypt_io(&gks, &mut stdin.lock(), &mut stdout.lock())
 }
 
-/// Inner implementation of `stream-decrypt` that takes generic IO
-/// handles, for testability.
-///
-/// Streaming sentinel scanner — does not depend on any delimiter
-/// between or around encrypted records on the wire. The scanner
-/// pulls bytes from `reader` into a rolling buffer and processes as
-/// many complete sentinels (and as much surrounding passthrough
-/// plaintext) as possible on each pass, then refills.
+/// Inner implementation of `decrypt-stream` that takes generic IO
+/// handles, for testability. Drives a [`StreamScanner`] to do all
+/// the actual sentinel scanning + decryption — this function is
+/// just I/O plumbing + tracing.
 fn stream_decrypt_io<R: BufRead, W: Write>(
     gks: &GksKeyMaterial,
     reader: &mut R,
     writer: &mut W,
 ) -> anyhow::Result<()> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut keys = HashMap::<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>::new();
+    let mut scanner = StreamScanner::new();
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
+    let mut total_records_ok: u64 = 0;
+    let mut total_records_failed: u64 = 0;
 
     info!(
         sha = build_info::get().scm_revision(),
         branch = build_info::get().scm_branch(),
-        "stream-decrypt started",
+        "decrypt-stream started",
     );
 
     loop {
         let n = {
             let chunk = reader.fill_buf().context("reading input")?;
             if chunk.is_empty() {
+                let stats = scanner
+                    .drain(gks, /* at_eof */ true, writer)
+                    .context("draining at EOF")?;
+                total_out += stats.bytes_out;
+                total_records_ok += stats.records_ok;
+                total_records_failed += stats.records_failed;
                 info!(
                     total_in,
                     total_out,
-                    sessions = keys.len(),
-                    "stream-decrypt EOF",
+                    sessions = scanner.sessions(),
+                    records_ok = total_records_ok,
+                    records_failed = total_records_failed,
+                    "decrypt-stream EOF",
                 );
-                drain_buffer(
-                    &mut buf,
-                    &mut keys,
-                    gks,
-                    writer,
-                    &mut total_out,
-                    /* at_eof */ true,
-                )?;
                 writer.flush().context("flushing output")?;
                 return Ok(());
             }
             debug!(
                 bytes = chunk.len(),
-                buf_before = buf.len(),
-                buf_after = buf.len() + chunk.len(),
+                buf_before = scanner.buffered(),
+                buf_after = scanner.buffered() + chunk.len(),
                 "fill_buf",
             );
             trace!(hex = ?HexSlice(chunk), "fill_buf bytes");
-            buf.extend_from_slice(chunk);
+            scanner.extend(chunk);
             chunk.len()
         };
         reader.consume(n);
         total_in += n as u64;
 
-        drain_buffer(
-            &mut buf,
-            &mut keys,
-            gks,
-            writer,
-            &mut total_out,
-            /* at_eof */ false,
-        )?;
+        let stats = scanner
+            .drain(gks, /* at_eof */ false, writer)
+            .context("draining")?;
+        total_out += stats.bytes_out;
+        total_records_ok += stats.records_ok;
+        total_records_failed += stats.records_failed;
+        debug!(
+            records_ok = stats.records_ok,
+            records_failed = stats.records_failed,
+            bytes_out = stats.bytes_out,
+            buffered = scanner.buffered(),
+            "drain",
+        );
         writer.flush().context("flushing output")?;
-    }
-}
-
-/// Process as many complete sentinels (and surrounding passthrough)
-/// from `buf` as possible. Removes consumed bytes from the front of
-/// `buf`. When `at_eof` is false, leaves any in-flight sentinel and
-/// up to `SENTINEL_OPEN.len() - 1` straddling tail bytes in `buf` so
-/// the next `fill_buf` can complete them. When `at_eof` is true,
-/// passes any remaining bytes through as plaintext.
-fn drain_buffer<W: Write>(
-    buf: &mut Vec<u8>,
-    keys: &mut HashMap<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>,
-    gks: &GksKeyMaterial,
-    writer: &mut W,
-    total_out: &mut u64,
-    at_eof: bool,
-) -> anyhow::Result<()> {
-    let mut cursor = 0;
-    loop {
-        match find_next_sentinel(buf, cursor) {
-            SentinelMatch::Found {
-                start,
-                end,
-                payload,
-            } => {
-                if start > cursor {
-                    let n = start - cursor;
-                    debug!(bytes = n, "passthrough before sentinel");
-                    writer
-                        .write_all(&buf[cursor..start])
-                        .context("writing passthrough")?;
-                    *total_out += n as u64;
-                }
-                let n = decrypt_and_write(gks, keys, &payload, writer)?;
-                *total_out += n as u64;
-                debug!(
-                    sentinel_start = start,
-                    sentinel_len = end - start,
-                    plaintext_bytes = n,
-                    "decrypt OK",
-                );
-                cursor = end;
-            }
-            SentinelMatch::Malformed { start, reason } => {
-                // Distinguish "we found `[[OHENC v1 ` but the buffer
-                // doesn't yet contain enough bytes to determine
-                // whether `]]` will appear inside the max-sentinel
-                // window" from "definitely malformed". Only the
-                // former should wait for more data.
-                let needs_more = !at_eof && matches!(reason, SentinelError::Unterminated) && {
-                    let max_search_end = start
-                        .saturating_add(SENTINEL_OPEN.len())
-                        .saturating_add(MAX_SENTINEL_BASE64_LEN)
-                        .saturating_add(SENTINEL_CLOSE.len());
-                    buf.len() < max_search_end
-                };
-
-                if needs_more {
-                    debug!(
-                        opener_at = start,
-                        buf_len = buf.len(),
-                        "in-flight sentinel — waiting for more bytes",
-                    );
-                    if start > cursor {
-                        let n = start - cursor;
-                        debug!(bytes = n, "passthrough before in-flight sentinel");
-                        writer
-                            .write_all(&buf[cursor..start])
-                            .context("writing passthrough")?;
-                        *total_out += n as u64;
-                    }
-                    cursor = start;
-                    break;
-                } else {
-                    warn!(
-                        opener_at = start,
-                        ?reason,
-                        "malformed sentinel — passing 1 byte through and resuming scan",
-                    );
-                    // Truly malformed (or EOF interrupted). Pass
-                    // through one byte and resume scanning so a
-                    // subsequent inner sentinel can still be
-                    // recognised.
-                    let pass_end = (start + 1).min(buf.len());
-                    let n = pass_end - cursor;
-                    writer
-                        .write_all(&buf[cursor..pass_end])
-                        .context("writing passthrough")?;
-                    *total_out += n as u64;
-                    cursor = pass_end;
-                }
-            }
-            SentinelMatch::NotFound => {
-                // Hold back the last `SENTINEL_OPEN.len() - 1` bytes
-                // when not at EOF: an opener could be straddling the
-                // tail of this read into the next fill.
-                let safe = if at_eof {
-                    buf.len()
-                } else {
-                    buf.len().saturating_sub(SENTINEL_OPEN.len() - 1)
-                };
-                if safe > cursor {
-                    let n = safe - cursor;
-                    debug!(
-                        bytes = n,
-                        held_back = buf.len() - safe,
-                        "passthrough (no sentinel found)",
-                    );
-                    writer
-                        .write_all(&buf[cursor..safe])
-                        .context("writing passthrough")?;
-                    *total_out += n as u64;
-                    cursor = safe;
-                }
-                break;
-            }
-        }
-    }
-    buf.drain(..cursor);
-    Ok(())
-}
-
-/// Decrypt one parsed payload and write its plaintext (or an
-/// inline error marker) to `writer`. AES key material is cached
-/// per `session_id` so repeated records reuse the KDF result.
-/// Returns the number of bytes written to `writer`.
-fn decrypt_and_write<W: Write>(
-    gks: &GksKeyMaterial,
-    keys: &mut HashMap<[u8; SESSION_ID_LEN], [u8; AES_KEY_LEN]>,
-    payload: &[u8],
-    writer: &mut W,
-) -> anyhow::Result<usize> {
-    match Record::parse_payload(payload) {
-        Ok(record) => {
-            let key = keys.entry(record.session_id).or_insert_with(|| {
-                debug!(
-                    session_id = ?HexSlice(&record.session_id),
-                    "deriving key for new session",
-                );
-                derive_aes_key(gks, &record.session_id).expect("KDF should not fail")
-            });
-            match openhcl_serial_console_crypto::crypto::decrypt(
-                key,
-                &record.session_id,
-                record.seq,
-                &record.nonce,
-                &record.ciphertext,
-                &record.tag,
-            ) {
-                Ok(plaintext) => {
-                    writer.write_all(&plaintext).context("writing decrypted")?;
-                    Ok(plaintext.len())
-                }
-                Err(e) => {
-                    warn!(
-                        seq = record.seq,
-                        ciphertext_len = record.ciphertext.len(),
-                        error = ?e,
-                        "decrypt failed",
-                    );
-                    let marker = format!("<<decrypt failed: {e}>>");
-                    writer
-                        .write_all(marker.as_bytes())
-                        .context("writing error marker")?;
-                    Ok(marker.len())
-                }
-            }
-        }
-        Err(e) => {
-            warn!(error = ?e, payload_len = payload.len(), "parse failed");
-            let marker = format!("<<parse failed: {e}>>");
-            writer
-                .write_all(marker.as_bytes())
-                .context("writing parse error")?;
-            Ok(marker.len())
-        }
     }
 }
 
@@ -390,6 +208,9 @@ impl std::fmt::Debug for HexSlice<'_> {
 mod tests {
     use super::*;
     use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
+    use openhcl_serial_console_crypto::consts::MAX_SENTINEL_BASE64_LEN;
+    use openhcl_serial_console_crypto::consts::SENTINEL_CLOSE;
+    use openhcl_serial_console_crypto::consts::SENTINEL_OPEN;
     use openhcl_serial_console_crypto::crypto::GKS_LEN;
     use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
     use std::io::Cursor;

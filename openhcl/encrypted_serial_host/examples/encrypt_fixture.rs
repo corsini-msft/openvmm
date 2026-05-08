@@ -1,21 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Developer-only round-trip helper for `decrypt-serial`.
+//! Developer-only round-trip helper for `encrypted-serial`.
 //!
 //! ⚠ **This is not a sanctioned production encrypt tool.** It exists
 //! solely so a developer can manually verify that the decryptor and
 //! the wire-format spec match end-to-end without needing a real
-//! VTL2 producer or a VM. The producer side that ships in OpenHCL
-//! VTL2 will be implemented in a separate PR; do not promote this
-//! example as a substitute.
+//! VTL2 producer or a VM.
 //!
 //! Usage:
 //!
 //! ```text
-//! cargo run --example encrypt_fixture -p decrypt-serial -- \
+//! cargo run --example encrypt_fixture -p encrypted-serial -- \
 //!     --key gks.bin --input my.log > capture.txt
-//! cargo run -p decrypt-serial -- \
+//! cargo run -p encrypted-serial -- decrypt-file \
 //!     --key gks.bin --input capture.txt
 //! # output should equal my.log
 //! ```
@@ -51,11 +49,11 @@ fn main() -> anyhow::Result<()> {
     use std::io::Write;
 
     /// Encrypt arbitrary plaintext into the v1 wire format used by
-    /// `decrypt-serial`. Developer aid only.
+    /// `encrypted-serial`. Developer aid only.
     #[derive(Parser, Debug)]
     #[command(
         name = "encrypt_fixture",
-        about = "Developer-only encrypt helper for decrypt-serial round-trip testing.",
+        about = "Developer-only encrypt helper for encrypted-serial round-trip testing.",
         group = ArgGroup::new("key_source").required(true).args(["key", "vmgs"]),
     )]
     struct Args {
