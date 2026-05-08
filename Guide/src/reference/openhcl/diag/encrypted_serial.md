@@ -114,8 +114,38 @@ compatibility.
 encrypted-serial decrypt-file --input <PATH> [--output <PATH>] (--key <PATH> | --vmgs <PATH>) [--strict]
 encrypted-serial decrypt-stream (--key <PATH> | --vmgs <PATH>) [--verbose]
 encrypted-serial encrypt-stream (--key <PATH> | --vmgs <PATH>) [--verbose]
+encrypted-serial bridge --pipe <PATH> (--key <PATH> | --vmgs <PATH>) [--verbose]
 encrypted-serial version
 ```
+
+### `bridge` (bidirectional)
+
+`bridge` is the recommended way to use the encrypted serial console
+interactively. It opens a single bidirectional pipe (typically a
+Hyper-V serial named pipe) and runs both directions over it:
+
+```sh
+encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3'
+```
+
+Behind the scenes the binary spawns two threads:
+
+- **decrypt thread:** reads encrypted records from the pipe,
+  decrypts them, and writes plaintext to stdout.
+- **encrypt thread:** reads bytes from stdin, encrypts each chunk
+  into a single record, and writes it to the pipe.
+
+Each direction owns its own AES-256-GCM session (independent
+`session_id`s, derived from the same shared GKS), so the two
+streams sharing one wire transport cannot collide on AES-GCM
+nonces.
+
+For per-keystroke latency rather than per-line, put your terminal
+in raw mode before invoking `bridge` — each `read()` call returns
+when the OS has bytes for you, so a raw-mode terminal produces
+one record per keystroke.
+
+### File / stream subcommands
 
 The most common flow extracts the GKS from the VM's VMGS file with
 `vmgstool` and then feeds it to `encrypted-serial decrypt-file`:
