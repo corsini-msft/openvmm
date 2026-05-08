@@ -1157,29 +1157,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "decrypt-serial"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "disk_backend",
- "disk_vhd1",
- "disklayer_ram",
- "fs-err",
- "getrandom 0.3.3",
- "openhcl_attestation_protocol",
- "openhcl_serial_console_crypto",
- "pal_async",
- "tempfile",
- "tpm_protocol",
- "tracing",
- "tracing-subscriber",
- "vmgs",
- "vmgs_format",
- "zerocopy",
-]
-
-[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1769,6 +1746,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1cc3c5651fb62ab8aa3103998dade57efdd028544bd300516baa31840c252a83"
 dependencies = [
  "encoding_rs",
+]
+
+[[package]]
+name = "encrypted-serial"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "build_info",
+ "build_rs_git_info",
+ "clap",
+ "disk_backend",
+ "disk_vhd1",
+ "disklayer_ram",
+ "fs-err",
+ "futures",
+ "getrandom 0.3.3",
+ "mesh",
+ "openhcl_attestation_protocol",
+ "openhcl_serial_console_crypto",
+ "pal_async",
+ "tempfile",
+ "term",
+ "tpm_protocol",
+ "tracing",
+ "tracing-subscriber",
+ "vmgs",
+ "vmgs_format",
+ "zerocopy",
 ]
 
 [[package]]

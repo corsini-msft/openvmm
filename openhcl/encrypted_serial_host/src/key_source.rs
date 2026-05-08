@@ -69,7 +69,7 @@ async fn read_gks_from_disk(disk: Disk) -> anyhow::Result<GksKeyMaterial> {
         .context("parsing VMGS structure")?;
     if vmgs.encrypted() {
         bail!(
-            "VMGS file is encrypted; decrypt-serial does not support unlocking encrypted VMGS files. \
+            "VMGS file is encrypted; encrypted-serial does not support unlocking encrypted VMGS files. \
              Extract the GuestSecretKey via attestation (or another out-of-band path) and pass it with --key."
         );
     }

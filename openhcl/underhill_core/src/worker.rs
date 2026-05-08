@@ -277,6 +277,10 @@ pub struct UnderhillEnvCfg {
     /// If true, emulated serial should not poll data until the guest sets DTR
     /// and RTS.
     pub emulated_serial_wait_for_rts: bool,
+    /// If true, do **not** wrap the COM ports with the encrypted-serial
+    /// wrapper; let plaintext flow end-to-end. Debugging knob to
+    /// isolate `EncryptedSerialIo` from the layers underneath it.
+    pub disable_encrypted_serial: bool,
     /// Force load the specified image in VTL0. The image must support the
     /// option specified.
     ///
@@ -2310,29 +2314,41 @@ async fn new_underhill_vm(
     // The bytes are zero-padded to `GKS_LEN` to match the
     // `read_guest_secret_key` behavior. If the slot is empty (no GSK
     // provisioned in this VMGS) we leave serial as plaintext rather
-    // than panic — see `decrypt-serial provision-gsk` for the dev path
-    // that seeds a VMGS.
-    let encrypted_serial_gks = match platform_attestation_data.guest_secret_key.as_deref() {
-        Some(bytes) if !bytes.is_empty() => {
-            let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
-            let n = bytes.len().min(buf.len());
-            buf[..n].copy_from_slice(&bytes[..n]);
-            if bytes.len() > buf.len() {
-                tracing::warn!(
-                    len = bytes.len(),
-                    expected = buf.len(),
-                    "VMGS GUEST_SECRET_KEY is longer than GKS_LEN; truncating"
-                );
+    // than panic — see `encrypted-serial provision-gsk` for the dev
+    // path that seeds a VMGS.
+    //
+    // Setting `OPENHCL_DISABLE_ENCRYPTED_SERIAL=1` short-circuits the
+    // VMGS lookup entirely and forces plaintext serial. Useful for
+    // debugging the underlying transport in isolation from the
+    // encryption wrapper.
+    let encrypted_serial_gks = if env_cfg.disable_encrypted_serial {
+        tracing::info!(
+            "OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper"
+        );
+        None
+    } else {
+        match platform_attestation_data.guest_secret_key.as_deref() {
+            Some(bytes) if !bytes.is_empty() => {
+                let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                if bytes.len() > buf.len() {
+                    tracing::warn!(
+                        len = bytes.len(),
+                        expected = buf.len(),
+                        "VMGS GUEST_SECRET_KEY is longer than GKS_LEN; truncating"
+                    );
+                }
+                Some(Arc::new(
+                    openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf),
+                ))
             }
-            Some(Arc::new(
-                openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf),
-            ))
-        }
-        _ => {
-            tracing::info!(
-                "no GUEST_SECRET_KEY provisioned in VMGS; encrypted serial disabled (plaintext)"
-            );
-            None
+            _ => {
+                tracing::info!(
+                    "no GUEST_SECRET_KEY provisioned in VMGS; encrypted serial disabled (plaintext)"
+                );
+                None
+            }
         }
     };
 

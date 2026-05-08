@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 [package]
-name = "decrypt-serial"
+name = "encrypted-serial"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -11,27 +11,34 @@ rust-version.workspace = true
 # that here so the workspace builds on Windows / macOS without trying
 # to compile the CLI's transitive openssl-only deps.
 [dependencies]
+build_info.workspace = true
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
+term.workspace = true
 tpm_protocol.workspace = true
 
 disk_backend.workspace = true
 disk_vhd1.workspace = true
+futures.workspace = true
 getrandom.workspace = true
+mesh.workspace = true
 pal_async.workspace = true
 vmgs.workspace = true
 vmgs_format.workspace = true
+zerocopy.workspace = true
 
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 fs-err.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-zerocopy.workspace = true
 
 [dev-dependencies]
 disklayer_ram.workspace = true
 tempfile.workspace = true
+
+[build-dependencies]
+build_rs_git_info.workspace = true
 
 [lints]
 workspace = true

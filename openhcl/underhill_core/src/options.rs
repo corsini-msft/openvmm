@@ -193,6 +193,14 @@ pub struct Options {
     /// from the host.
     pub serial_wait_for_rts: bool,
 
+    /// (OPENHCL_DISABLE_ENCRYPTED_SERIAL=\<bool\>)
+    /// If set, do **not** wrap the COM ports with `EncryptedSerialIo`.
+    /// Bytes flow plaintext between the guest UART and the host's
+    /// vmbus serial transport. Intended only for isolating bugs in
+    /// the encryption wrapper from bugs further down the stack;
+    /// production builds should leave encryption on.
+    pub disable_encrypted_serial: bool,
+
     /// (OPENHCL_FORCE_LOAD_VTL0_IMAGE=\<string\>)
     /// Force load the specified image in VTL0. The image must support the
     /// option specified.
@@ -394,6 +402,8 @@ impl Options {
         let framebuffer_gpa_base = parse_legacy_env_number("OPENHCL_FRAMEBUFFER_GPA_BASE")?;
         let vtl0_starts_paused = parse_legacy_env_bool("OPENHCL_VTL0_STARTS_PAUSED");
         let serial_wait_for_rts = parse_legacy_env_bool("OPENHCL_SERIAL_WAIT_FOR_RTS");
+        let disable_encrypted_serial =
+            parse_legacy_env_bool("OPENHCL_DISABLE_ENCRYPTED_SERIAL");
         let nvme_vfio = parse_legacy_env_bool("OPENHCL_NVME_VFIO");
         let hide_isolation = parse_env_bool("OPENHCL_HIDE_ISOLATION");
         let halt_on_guest_halt = parse_legacy_env_bool("OPENHCL_HALT_ON_GUEST_HALT");
@@ -513,6 +523,7 @@ impl Options {
             gdbstub_port: gdbstub_port.unwrap_or(4),
             vtl0_starts_paused,
             serial_wait_for_rts,
+            disable_encrypted_serial,
             force_load_vtl0_image,
             nvme_vfio,
             hide_isolation,

@@ -316,6 +316,7 @@ async fn launch_workers(
         reformat_vmgs: opt.reformat_vmgs,
         vtl0_starts_paused: opt.vtl0_starts_paused,
         emulated_serial_wait_for_rts: opt.serial_wait_for_rts,
+        disable_encrypted_serial: opt.disable_encrypted_serial,
         force_load_vtl0_image: opt.force_load_vtl0_image,
         nvme_vfio: opt.nvme_vfio,
         halt_on_guest_halt: opt.halt_on_guest_halt,

@@ -13,7 +13,7 @@ members = [
   "flowey/flowey_hvlite",
   "xtask",
   # openhcl
-  "openhcl/decrypt_serial",
+  "openhcl/encrypted_serial_host",
   "openhcl/ohcldiag-dev",
   "openhcl/openhcl_boot",
   "openhcl/openvmm_hcl",

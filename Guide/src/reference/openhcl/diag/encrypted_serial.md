@@ -1,8 +1,11 @@
-# decrypt-serial
+# encrypted-serial
 
-`decrypt-serial` is a host-side dev/debug tool for decrypting serial console
-output that has been emitted by OpenHCL VTL2 in the **encrypted serial
-console v1** wire format.
+`encrypted-serial` is a host-side dev/debug tool for encrypting and
+decrypting serial console traffic that goes through OpenHCL VTL2 in
+the **encrypted serial console v1** wire format. It supports both
+directions: decrypting captures and live streams emitted by VTL2,
+and (with the `bridge` subcommand) encrypting user input to be sent
+back to VTL2.
 
 The crate currently only builds on Linux, because the underlying
 `crypto::kdf::kbkdf_hmac_sha256` primitive in the workspace `crypto` crate
@@ -108,11 +111,54 @@ compatibility.
 ## Usage
 
 ```text
-decrypt-serial --input <PATH> [--output <PATH>] (--key <PATH> | --vmgs <PATH>) [--strict]
+encrypted-serial decrypt-file --input <PATH> [--output <PATH>] (--key <PATH> | --vmgs <PATH>) [--strict]
+encrypted-serial decrypt-stream (--key <PATH> | --vmgs <PATH>) [--verbose]
+encrypted-serial encrypt-stream (--key <PATH> | --vmgs <PATH>) [--verbose]
+encrypted-serial bridge --pipe <PATH> (--key <PATH> | --vmgs <PATH>) [--verbose]
+encrypted-serial version
 ```
 
+### `bridge` (bidirectional)
+
+`bridge` is the recommended way to use the encrypted serial console
+interactively. It opens a single bidirectional pipe (typically a
+Hyper-V serial named pipe) and runs both directions over it:
+
+```sh
+encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3'
+```
+
+If the pipe doesn't exist yet (e.g. you launched `bridge` before
+starting the VM), pass `--wait` to retry every 500 ms forever
+until it's available — Ctrl+C aborts:
+
+```sh
+# Order-independent: works whether you start the VM before or
+# after the bridge.
+encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3' --wait
+```
+
+Behind the scenes the binary spawns two threads:
+
+- **decrypt thread:** reads encrypted records from the pipe,
+  decrypts them, and writes plaintext to stdout.
+- **encrypt thread:** reads bytes from stdin, encrypts each chunk
+  into a single record, and writes it to the pipe.
+
+Each direction owns its own AES-256-GCM session (independent
+`session_id`s, derived from the same shared GKS), so the two
+streams sharing one wire transport cannot collide on AES-GCM
+nonces.
+
+For per-keystroke latency rather than per-line, put your terminal
+in raw mode before invoking `bridge` — each `read()` call returns
+when the OS has bytes for you, so a raw-mode terminal produces
+one record per keystroke.
+
+### File / stream subcommands
+
 The most common flow extracts the GKS from the VM's VMGS file with
-`vmgstool` and then feeds it to `decrypt-serial`:
+`vmgstool` and then feeds it to `encrypted-serial decrypt-file`:
 
 ```sh
 # 1. Extract GUEST_SECRET_KEY (FileId 13) out of the VMGS file.
@@ -120,14 +166,14 @@ vmgstool dump --filepath my_vm.vmgs --fileid GUEST_SECRET_KEY \
               --datapath gks.bin --raw-stdout
 
 # 2. Decrypt a captured serial log.
-decrypt-serial --key gks.bin --input com3-capture.txt
+encrypted-serial decrypt-file --key gks.bin --input com3-capture.txt
 ```
 
 If the VMGS file is plaintext (i.e. not encrypted at rest), you can pass
 it directly and skip the manual extraction step:
 
 ```sh
-decrypt-serial --vmgs my_vm.vmgs --input com3-capture.txt
+encrypted-serial decrypt-file --vmgs my_vm.vmgs --input com3-capture.txt
 ```
 
 Encrypted VMGS files are explicitly **not** supported by `--vmgs`;
@@ -169,11 +215,11 @@ encrypt CLI.** The eventual VTL2 producer will live in OpenHCL itself.
 head -c 2048 /dev/urandom > gks.bin
 
 # Encrypt some plaintext.
-cargo run --example encrypt_fixture -p decrypt-serial -- \
+cargo run --example encrypt_fixture -p encrypted-serial -- \
     --key gks.bin --input my.log --output capture.txt
 
 # Decrypt and verify.
-cargo run -p decrypt-serial -- \
+cargo run -p encrypted-serial -- decrypt-file \
     --key gks.bin --input capture.txt --output recovered.log
 
 diff my.log recovered.log
@@ -196,14 +242,14 @@ in a plaintext development VMGS with the `provision-gsk` subcommand.
 
 ```sh
 # Provision a TPM2_Import-shaped blob into the VMGS.
-decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-blob importable.bin
+encrypted-serial provision-gsk --vmgs my_vm.vmgs --from-blob importable.bin
 
 # Overwriting an existing slot requires --force.
-decrypt-serial provision-gsk --vmgs my_vm.vmgs --from-blob importable.bin --force
+encrypted-serial provision-gsk --vmgs my_vm.vmgs --from-blob importable.bin --force
 ```
 
 Producing the importable blob itself is out of scope for this tool.
-For a known-good test fixture, see `openhcl/decrypt_serial/test_data/
+For a known-good test fixture, see `openhcl/encrypted_serial_host/test_data/
 tpm_import_blob.bin` (a 422-byte mirror of the
 `GUEST_SECRET_KEY_BLOB` constant in
 `vm/devices/tpm/tpm_lib/src/lib.rs`). For real provisioning, generate
@@ -211,9 +257,9 @@ a duplicate blob using `tpm2-tools`, OpenSSL+marshalling, or
 equivalent CPS tooling.
 
 Once provisioned, the same `--vmgs` file can be passed back to
-`decrypt-serial decrypt` (or the streaming subcommands) so the host-side
-tool reads exactly the bytes the producer in OpenHCL VTL2 will derive
-its AES key from.
+`encrypted-serial decrypt-file` (or the streaming subcommands) so the
+host-side tool reads exactly the bytes the producer in OpenHCL VTL2
+will derive its AES key from.
 
 ## When the producer ships
 
@@ -226,6 +272,6 @@ The follow-up PR that adds the VTL2 producer side should:
 3. Emit framed records on COM3 (or wherever the encrypted serial sink
    lives) using the format spec above.
 4. Add a petri/VMM test that boots a VM with the producer enabled,
-   captures the serial output to a file, runs `decrypt-serial` against
-   it, and asserts the recovered plaintext matches the expected
-   in-guest log lines.
+   captures the serial output to a file, runs `encrypted-serial`
+   against it, and asserts the recovered plaintext matches the
+   expected in-guest log lines.

@@ -4,7 +4,7 @@
 //! Developer-only helper to seed `FileId::GUEST_SECRET_KEY` in a
 //! plaintext VMGS file with a TPM2_Import-shaped duplicate blob that
 //! the encrypted-serial producer (in OpenHCL VTL2) and the
-//! `decrypt-serial` consumer can share.
+//! `encrypted-serial` consumer can share.
 //!
 //! ⚠ **Not a production provisioning tool.** Real GSK provisioning
 //! happens through CPS / attestation flows. This subcommand exists

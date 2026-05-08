@@ -1,4 +1,4 @@
-# decrypt-serial test data
+# encrypted-serial test data
 
 `tpm_import_blob.bin` — a 422-byte known-good TPM2_Import duplicate
 blob (no inner wrapping key) used by `provision::tests` to exercise
