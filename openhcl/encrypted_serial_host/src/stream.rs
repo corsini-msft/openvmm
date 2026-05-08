@@ -26,7 +26,7 @@ use anyhow::Context;
 use openhcl_serial_console_crypto::consts::MAX_PLAINTEXT_LEN;
 use openhcl_serial_console_crypto::consts::NONCE_LEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
-use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
@@ -41,23 +41,23 @@ use tracing::trace;
 /// Read plaintext from stdin, encrypt each line, and write
 /// `[[OHENC v1 ...]]` records to stdout.
 pub fn stream_encrypt(key: &Option<PathBuf>, vmgs: &Option<PathBuf>) -> anyhow::Result<()> {
-    let gks = super::resolve_key(key, vmgs).context("resolving key source")?;
+    let gsk = super::resolve_key(key, vmgs).context("resolving key source")?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    stream_encrypt_io(&gks, &mut stdin.lock(), &mut stdout.lock())
+    stream_encrypt_io(&gsk, &mut stdin.lock(), &mut stdout.lock())
 }
 
 /// Inner implementation of `encrypt-stream` that takes generic IO
 /// handles, for testability.
 fn stream_encrypt_io<R: BufRead, W: Write>(
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     reader: &mut R,
     writer: &mut W,
 ) -> anyhow::Result<()> {
     let mut session_id = [0u8; SESSION_ID_LEN];
     getrandom::fill(&mut session_id).map_err(|e| anyhow::anyhow!("generating session_id: {e}"))?;
 
-    let aes_key = derive_aes_key(gks, &session_id).context("deriving AES key")?;
+    let aes_key = derive_aes_key(gsk, &session_id).context("deriving AES key")?;
 
     let mut seq: u64 = 0;
 
@@ -104,10 +104,10 @@ fn stream_encrypt_io<R: BufRead, W: Write>(
 /// decrypt any `[[OHENC v1 ...]]` records, and write all output
 /// (decrypted records + passthrough plaintext) to stdout.
 pub fn stream_decrypt(key: &Option<PathBuf>, vmgs: &Option<PathBuf>) -> anyhow::Result<()> {
-    let gks = super::resolve_key(key, vmgs).context("resolving key source")?;
+    let gsk = super::resolve_key(key, vmgs).context("resolving key source")?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    stream_decrypt_io(&gks, &mut stdin.lock(), &mut stdout.lock())
+    stream_decrypt_io(&gsk, &mut stdin.lock(), &mut stdout.lock())
 }
 
 /// Inner implementation of `decrypt-stream` that takes generic IO
@@ -115,7 +115,7 @@ pub fn stream_decrypt(key: &Option<PathBuf>, vmgs: &Option<PathBuf>) -> anyhow::
 /// the actual sentinel scanning + decryption — this function is
 /// just I/O plumbing + tracing.
 fn stream_decrypt_io<R: BufRead, W: Write>(
-    gks: &GksKeyMaterial,
+    gsk: &GskKeyMaterial,
     reader: &mut R,
     writer: &mut W,
 ) -> anyhow::Result<()> {
@@ -136,7 +136,7 @@ fn stream_decrypt_io<R: BufRead, W: Write>(
             let chunk = reader.fill_buf().context("reading input")?;
             if chunk.is_empty() {
                 let stats = scanner
-                    .drain(gks, /* at_eof */ true, writer)
+                    .drain(gsk, /* at_eof */ true, writer)
                     .context("draining at EOF")?;
                 total_out += stats.bytes_out;
                 total_records_ok += stats.records_ok;
@@ -166,7 +166,7 @@ fn stream_decrypt_io<R: BufRead, W: Write>(
         total_in += n as u64;
 
         let stats = scanner
-            .drain(gks, /* at_eof */ false, writer)
+            .drain(gsk, /* at_eof */ false, writer)
             .context("draining")?;
         total_out += stats.bytes_out;
         total_records_ok += stats.records_ok;
@@ -211,30 +211,30 @@ mod tests {
     use openhcl_serial_console_crypto::consts::MAX_SENTINEL_BASE64_LEN;
     use openhcl_serial_console_crypto::consts::SENTINEL_CLOSE;
     use openhcl_serial_console_crypto::consts::SENTINEL_OPEN;
-    use openhcl_serial_console_crypto::crypto::GKS_LEN;
-    use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+    use openhcl_serial_console_crypto::crypto::GSK_LEN;
+    use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
     use std::io::Cursor;
     use std::io::Read;
 
-    /// Build a deterministic 2048-byte GKS for tests (matches the
+    /// Build a deterministic 2048-byte GSK for tests (matches the
     /// stub key shape used by the producer integration in
     /// `worker.rs:2310-2318`, but the tests don't depend on that
-    /// exact pattern — they just need any well-formed GKS).
-    fn test_gks() -> GksKeyMaterial {
-        let mut buf = [0u8; GKS_LEN];
+    /// exact pattern — they just need any well-formed GSK).
+    fn test_gsk() -> GskKeyMaterial {
+        let mut buf = [0u8; GSK_LEN];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
         }
-        GksKeyMaterial(buf)
+        GskKeyMaterial(buf)
     }
 
     fn round_trip(input: &[u8]) -> Vec<u8> {
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut encrypted = Vec::new();
-        stream_encrypt_io(&gks, &mut Cursor::new(input), &mut encrypted)
+        stream_encrypt_io(&gsk, &mut Cursor::new(input), &mut encrypted)
             .expect("stream_encrypt_io should succeed");
         let mut decrypted = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(&encrypted), &mut decrypted)
+        stream_decrypt_io(&gsk, &mut Cursor::new(&encrypted), &mut decrypted)
             .expect("stream_decrypt_io should succeed");
         decrypted
     }
@@ -290,10 +290,10 @@ mod tests {
     fn stream_decrypt_passes_through_plaintext_with_newline() {
         // Plaintext that doesn't contain any sentinel should pass
         // through verbatim, including its trailing `\n`.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut output = Vec::new();
         stream_decrypt_io(
-            &gks,
+            &gsk,
             &mut Cursor::new(b"plain text line one\nplain text line two\n"),
             &mut output,
         )
@@ -303,9 +303,9 @@ mod tests {
 
     #[test]
     fn stream_decrypt_preserves_blank_lines() {
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(b"a\n\nb\n"), &mut output)
+        stream_decrypt_io(&gsk, &mut Cursor::new(b"a\n\nb\n"), &mut output)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(output, b"a\n\nb\n");
     }
@@ -313,8 +313,8 @@ mod tests {
     /// Encrypt a single plaintext payload outside of `stream_encrypt_io`
     /// so tests can construct exact wire-format inputs.
     fn encode_one(plaintext: &[u8], session_id: [u8; SESSION_ID_LEN], seq: u64) -> Vec<u8> {
-        let gks = test_gks();
-        let aes_key: [u8; AES_KEY_LEN] = derive_aes_key(&gks, &session_id).unwrap();
+        let gsk = test_gsk();
+        let aes_key: [u8; AES_KEY_LEN] = derive_aes_key(&gsk, &session_id).unwrap();
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce).expect("getrandom");
         let (ciphertext, tag) =
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn stream_decrypt_handles_mixed_plaintext_and_records() {
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut session_id = [0u8; SESSION_ID_LEN];
         getrandom::fill(&mut session_id).expect("getrandom");
 
@@ -343,7 +343,7 @@ mod tests {
         input.extend_from_slice(b"third plaintext line\n");
 
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(&input), &mut output)
+        stream_decrypt_io(&gsk, &mut Cursor::new(&input), &mut output)
             .expect("stream_decrypt_io should succeed");
 
         assert_eq!(
@@ -357,11 +357,11 @@ mod tests {
         // Multi-line input encrypts to multiple records — confirm the
         // wire bytes contain exactly N sentinels, no `\n` between them,
         // and the round-trip restores the original input.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let input = b"alpha\nbeta\ngamma\n";
 
         let mut encrypted = Vec::new();
-        stream_encrypt_io(&gks, &mut Cursor::new(input), &mut encrypted)
+        stream_encrypt_io(&gsk, &mut Cursor::new(input), &mut encrypted)
             .expect("stream_encrypt_io should succeed");
 
         // Wire should contain three `[[OHENC v1 ` openers and three
@@ -378,7 +378,7 @@ mod tests {
         );
 
         let mut decrypted = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(&encrypted), &mut decrypted)
+        stream_decrypt_io(&gsk, &mut Cursor::new(&encrypted), &mut decrypted)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(decrypted, input);
     }
@@ -388,7 +388,7 @@ mod tests {
         // Three pre-built records concatenated with absolutely
         // nothing between them — exactly what the new producer wire
         // format will emit.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut session_id = [0u8; SESSION_ID_LEN];
         getrandom::fill(&mut session_id).expect("getrandom");
         let mut input = Vec::new();
@@ -397,7 +397,7 @@ mod tests {
         input.extend_from_slice(&encode_one(b"three\n", session_id, 2));
 
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(&input), &mut output)
+        stream_decrypt_io(&gsk, &mut Cursor::new(&input), &mut output)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(output, b"one\ntwo\nthree\n");
     }
@@ -455,15 +455,15 @@ mod tests {
         // produces, but fed through a reader that surfaces one byte
         // per fill_buf call. Forces the scanner to accumulate across
         // many partial reads.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let input = b"alpha\nbeta\ngamma\n";
         let mut encrypted = Vec::new();
-        stream_encrypt_io(&gks, &mut Cursor::new(input), &mut encrypted)
+        stream_encrypt_io(&gsk, &mut Cursor::new(input), &mut encrypted)
             .expect("stream_encrypt_io should succeed");
 
         let mut output = Vec::new();
         let mut reader = OneAtATime::new(&encrypted);
-        stream_decrypt_io(&gks, &mut reader, &mut output)
+        stream_decrypt_io(&gsk, &mut reader, &mut output)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(output, input);
     }
@@ -474,7 +474,7 @@ mod tests {
         // completes the opener and the rest of the record. Verify
         // the scanner doesn't emit the partial opener bytes as
         // passthrough.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut session_id = [0u8; SESSION_ID_LEN];
         getrandom::fill(&mut session_id).expect("getrandom");
         let sentinel = encode_one(b"hello\n", session_id, 0);
@@ -523,7 +523,7 @@ mod tests {
             pos: 0,
         };
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut reader, &mut output)
+        stream_decrypt_io(&gsk, &mut reader, &mut output)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(output, b"prefix hello\n");
     }
@@ -532,10 +532,10 @@ mod tests {
     fn streaming_scanner_passthrough_no_terminator() {
         // No newlines anywhere, no sentinels — must still emit the
         // bytes as plaintext rather than hanging waiting for `\n`.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let input = b"no newline anywhere in this stream";
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(input), &mut output)
+        stream_decrypt_io(&gsk, &mut Cursor::new(input), &mut output)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(output, input);
     }
@@ -546,10 +546,10 @@ mod tests {
         // whether the bytes are real sentinel start or coincidental
         // plaintext, so it must pass them through verbatim rather
         // than silently dropping them.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let input = b"plain prefix [[OHENC v1 ";
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(input), &mut output)
+        stream_decrypt_io(&gsk, &mut Cursor::new(input), &mut output)
             .expect("stream_decrypt_io should succeed");
         assert_eq!(output, input);
     }
@@ -560,14 +560,14 @@ mod tests {
         // the maximum legal sentinel size — so further reads can't
         // possibly complete a valid sentinel. Must pass through
         // (slowly, byte-at-a-time) rather than wait or hang.
-        let gks = test_gks();
+        let gsk = test_gsk();
         let mut input = Vec::new();
         input.extend_from_slice(b"[[OHENC v1 ");
         input.resize(input.len() + MAX_SENTINEL_BASE64_LEN + 16, b'A');
         input.extend_from_slice(b"trailing\n");
 
         let mut output = Vec::new();
-        stream_decrypt_io(&gks, &mut Cursor::new(&input), &mut output)
+        stream_decrypt_io(&gsk, &mut Cursor::new(&input), &mut output)
             .expect("stream_decrypt_io should succeed");
         // We don't assert exact byte-equality with input because the
         // scanner may legitimately interpret a coincidental inner

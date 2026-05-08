@@ -245,7 +245,7 @@ fn run_version() -> std::process::ExitCode {
 fn resolve_key(
     key: &Option<std::path::PathBuf>,
     vmgs: &Option<std::path::PathBuf>,
-) -> anyhow::Result<openhcl_serial_console_crypto::crypto::GksKeyMaterial> {
+) -> anyhow::Result<openhcl_serial_console_crypto::crypto::GskKeyMaterial> {
     let source = match (key.clone(), vmgs.clone()) {
         (Some(p), None) => key_source::KeySource::Key(p),
         (None, Some(p)) => key_source::KeySource::Vmgs(p),
@@ -261,16 +261,16 @@ fn run_decrypt_file(args: &DecryptArgs) -> std::process::ExitCode {
 
     let result = (|| -> anyhow::Result<decrypt_file::DecryptStats> {
         let input = fs_err::read(&args.input).context("reading --input file")?;
-        let gks = resolve_key(&args.key, &args.vmgs).context("resolving key source")?;
+        let gsk = resolve_key(&args.key, &args.vmgs).context("resolving key source")?;
         let stats = if let Some(out_path) = args.output.as_ref() {
             let mut out = fs_err::File::create(out_path).context("creating --output file")?;
-            let stats = decrypt_file::run(&input, &mut out, &gks, args.strict)?;
+            let stats = decrypt_file::run(&input, &mut out, &gsk, args.strict)?;
             out.flush().context("flushing --output file")?;
             stats
         } else {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            let stats = decrypt_file::run(&input, &mut out, &gks, args.strict)?;
+            let stats = decrypt_file::run(&input, &mut out, &gsk, args.strict)?;
             out.flush().context("flushing stdout")?;
             stats
         };

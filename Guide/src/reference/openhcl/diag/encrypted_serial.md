@@ -87,11 +87,11 @@ content-dependent.
 ## Per-session keys
 
 The AES-256-GCM key is derived per-`session_id` from the 2048-byte
-`GUEST_SECRET_KEY` (GKS) blob in the VMGS:
+`GUEST_SECRET_KEY` (GSK) blob in the VMGS:
 
 ```
 aes_key = KBKDF-HMAC-SHA-256(
-    key        = GKS bytes (2048),
+    key        = GSK bytes (2048),
     context    = b"OpenHCL encrypted serial console v1 AES-256-GCM key",
     salt       = session_id (16 bytes),
     output_len = 32,
@@ -125,7 +125,7 @@ interactively. It opens a single bidirectional pipe (typically a
 Hyper-V serial named pipe) and runs both directions over it:
 
 ```sh
-encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3'
+encrypted-serial bridge --key gsk.bin --pipe '\\.\pipe\my-vm-com3'
 ```
 
 If the pipe doesn't exist yet (e.g. you launched `bridge` before
@@ -135,7 +135,7 @@ until it's available — Ctrl+C aborts:
 ```sh
 # Order-independent: works whether you start the VM before or
 # after the bridge.
-encrypted-serial bridge --key gks.bin --pipe '\\.\pipe\my-vm-com3' --wait
+encrypted-serial bridge --key gsk.bin --pipe '\\.\pipe\my-vm-com3' --wait
 ```
 
 Behind the scenes the binary spawns two threads:
@@ -146,7 +146,7 @@ Behind the scenes the binary spawns two threads:
   into a single record, and writes it to the pipe.
 
 Each direction owns its own AES-256-GCM session (independent
-`session_id`s, derived from the same shared GKS), so the two
+`session_id`s, derived from the same shared GSK), so the two
 streams sharing one wire transport cannot collide on AES-GCM
 nonces.
 
@@ -157,16 +157,16 @@ one record per keystroke.
 
 ### File / stream subcommands
 
-The most common flow extracts the GKS from the VM's VMGS file with
+The most common flow extracts the GSK from the VM's VMGS file with
 `vmgstool` and then feeds it to `encrypted-serial decrypt-file`:
 
 ```sh
 # 1. Extract GUEST_SECRET_KEY (FileId 13) out of the VMGS file.
 vmgstool dump --filepath my_vm.vmgs --fileid GUEST_SECRET_KEY \
-              --datapath gks.bin --raw-stdout
+              --datapath gsk.bin --raw-stdout
 
 # 2. Decrypt a captured serial log.
-encrypted-serial decrypt-file --key gks.bin --input com3-capture.txt
+encrypted-serial decrypt-file --key gsk.bin --input com3-capture.txt
 ```
 
 If the VMGS file is plaintext (i.e. not encrypted at rest), you can pass
@@ -185,7 +185,7 @@ error pointing back at the `--key` workflow.
 
 - **Plaintext passthrough.** Bytes that appear outside any sentinel are
   copied through to the output verbatim, so a capture that starts with
-  plaintext boot output and switches to encrypted records once the GKS
+  plaintext boot output and switches to encrypted records once the GSK
   becomes available decrypts cleanly into a single readable stream.
 - **Decrypt failures (default).** Tampered or malformed records are
   reported with an inline `<<decrypt failed offset=N reason=...>>`
@@ -211,16 +211,16 @@ decryptor consumes. **It is a developer aid only — not a sanctioned
 encrypt CLI.** The eventual VTL2 producer will live in OpenHCL itself.
 
 ```sh
-# Generate a random 2 KB GKS for testing.
-head -c 2048 /dev/urandom > gks.bin
+# Generate a random 2 KB GSK for testing.
+head -c 2048 /dev/urandom > gsk.bin
 
 # Encrypt some plaintext.
 cargo run --example encrypt_fixture -p encrypted-serial -- \
-    --key gks.bin --input my.log --output capture.txt
+    --key gsk.bin --input my.log --output capture.txt
 
 # Decrypt and verify.
 cargo run -p encrypted-serial -- decrypt-file \
-    --key gks.bin --input capture.txt --output recovered.log
+    --key gsk.bin --input capture.txt --output recovered.log
 
 diff my.log recovered.log
 ```
@@ -268,7 +268,7 @@ The follow-up PR that adds the VTL2 producer side should:
 1. Take a dependency on `openhcl_serial_console_crypto` to inherit the
    wire format and key derivation.
 2. Generate a fresh random 16-byte `session_id` once at startup, after
-   the VMGS unlock makes the GKS available.
+   the VMGS unlock makes the GSK available.
 3. Emit framed records on COM3 (or wherever the encrypted serial sink
    lives) using the format spec above.
 4. Add a petri/VMM test that boots a VM with the producer enabled,

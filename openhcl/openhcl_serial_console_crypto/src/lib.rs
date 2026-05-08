@@ -9,7 +9,7 @@
 //! `FileId::GUEST_SECRET_KEY` blob from the VMGS). This crate defines:
 //!
 //! * The text-safe **wire format** producers emit and consumers parse.
-//! * The **AES-256-GCM key derivation** from the 2048-byte GKS, keyed
+//! * The **AES-256-GCM key derivation** from the 2048-byte GSK, keyed
 //!   per-session by a 16-byte `session_id` so producers are free to
 //!   use either random or counter nonces within a session without
 //!   risking nonce reuse across reboots.

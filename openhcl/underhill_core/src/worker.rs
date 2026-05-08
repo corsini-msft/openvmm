@@ -2309,9 +2309,9 @@ async fn new_underhill_vm(
 
     let mut serial_inputs = [None, None, None, None];
 
-    // Source the encrypted-serial GKS from the same VMGS slot that
+    // Source the encrypted-serial GSK from the same VMGS slot that
     // attestation already populated (`FileId::GUEST_SECRET_KEY`).
-    // The bytes are zero-padded to `GKS_LEN` to match the
+    // The bytes are zero-padded to `GSK_LEN` to match the
     // `read_guest_secret_key` behavior. If the slot is empty (no GSK
     // provisioned in this VMGS) we leave serial as plaintext rather
     // than panic — see `encrypted-serial provision-gsk` for the dev
@@ -2321,7 +2321,7 @@ async fn new_underhill_vm(
     // VMGS lookup entirely and forces plaintext serial. Useful for
     // debugging the underlying transport in isolation from the
     // encryption wrapper.
-    let encrypted_serial_gks = if env_cfg.disable_encrypted_serial {
+    let encrypted_serial_gsk = if env_cfg.disable_encrypted_serial {
         tracing::info!(
             "OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper"
         );
@@ -2329,18 +2329,18 @@ async fn new_underhill_vm(
     } else {
         match platform_attestation_data.guest_secret_key.as_deref() {
             Some(bytes) if !bytes.is_empty() => {
-                let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+                let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GSK_LEN];
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
                 if bytes.len() > buf.len() {
                     tracing::warn!(
                         len = bytes.len(),
                         expected = buf.len(),
-                        "VMGS GUEST_SECRET_KEY is longer than GKS_LEN; truncating"
+                        "VMGS GUEST_SECRET_KEY is longer than GSK_LEN; truncating"
                     );
                 }
                 Some(Arc::new(
-                    openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf),
+                    openhcl_serial_console_crypto::crypto::GskKeyMaterial(buf),
                 ))
             }
             _ => {
@@ -2352,10 +2352,10 @@ async fn new_underhill_vm(
         }
     };
 
-    if let Some(gks) = encrypted_serial_gks.clone() {
+    if let Some(gsk) = encrypted_serial_gsk.clone() {
         tracing::info!("registering encrypted serial backend resolver");
         resolver.add_async_resolver(
-            crate::emuplat::encrypted_serial::EncryptedSerialBackendResolver { gks },
+            crate::emuplat::encrypted_serial::EncryptedSerialBackendResolver { gsk },
         );
     }
 
@@ -2367,7 +2367,7 @@ async fn new_underhill_vm(
             )
             .context("failed to open com1")?,
         );
-        serial_inputs[0] = Some(if encrypted_serial_gks.is_some() {
+        serial_inputs[0] = Some(if encrypted_serial_gsk.is_some() {
             Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
         } else {
             inner
@@ -2382,7 +2382,7 @@ async fn new_underhill_vm(
             )
             .context("failed to open com2")?,
         );
-        serial_inputs[1] = Some(if encrypted_serial_gks.is_some() {
+        serial_inputs[1] = Some(if encrypted_serial_gsk.is_some() {
             Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
         } else {
             inner

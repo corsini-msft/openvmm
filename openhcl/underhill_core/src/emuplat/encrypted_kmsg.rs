@@ -23,7 +23,7 @@
 use openhcl_serial_console_crypto::consts::MAX_PLAINTEXT_LEN;
 use openhcl_serial_console_crypto::consts::NONCE_LEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
-use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
+use openhcl_serial_console_crypto::crypto::GskKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
 use openhcl_serial_console_crypto::crypto::encrypt;
 use openhcl_serial_console_crypto::format::Record;
@@ -51,12 +51,12 @@ impl EncryptingKmsgWriter {
     /// Create a new encrypting kmsg writer.
     ///
     /// Derives a per-session AES key from the provided GSK material.
-    pub fn new(inner: kmsg_writer::KmsgWriter, gks: &GksKeyMaterial) -> std::io::Result<Self> {
+    pub fn new(inner: kmsg_writer::KmsgWriter, gsk: &GskKeyMaterial) -> std::io::Result<Self> {
         let mut session_id = [0u8; SESSION_ID_LEN];
         getrandom::fill(&mut session_id)
             .map_err(|e| std::io::Error::other(format!("session_id generation failed: {e}")))?;
 
-        let aes_key = derive_aes_key(gks, &session_id)
+        let aes_key = derive_aes_key(gsk, &session_id)
             .map_err(|e| std::io::Error::other(format!("AES key derivation failed: {e}")))?;
 
         Ok(Self {
