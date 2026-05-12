@@ -14,6 +14,7 @@ rust-version.workspace = true
 build_info.workspace = true
 openhcl_attestation_protocol.workspace = true
 openhcl_serial_console_crypto.workspace = true
+openssl = { workspace = true, features = ["vendored"] }
 term.workspace = true
 tpm_protocol.workspace = true
 

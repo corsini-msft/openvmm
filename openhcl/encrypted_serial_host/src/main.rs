@@ -83,7 +83,7 @@ struct DecryptArgs {
 
 #[derive(clap::Args, Debug)]
 #[command(
-    group = ArgGroup::new("provision_source").required(true).args(["from_blob"]),
+    group = ArgGroup::new("provision_source").required(true).args(["from_blob", "generate"]),
 )]
 struct ProvisionGskArgs {
     /// Plaintext VMGS file to provision. Must be opened read-write
@@ -94,8 +94,18 @@ struct ProvisionGskArgs {
     /// Read a TPM2_Import duplicate blob (no inner wrapping key)
     /// from a file. Validated against the same parser the vTPM
     /// uses at first boot before being written.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "generate")]
     from_blob: Option<std::path::PathBuf>,
+
+    /// Generate a fresh RSA-2048 keypair and format it as a
+    /// TPM2_Import duplicate blob.
+    #[arg(long, conflicts_with = "from_blob")]
+    generate: bool,
+
+    /// When using --generate, also write the raw blob to this file
+    /// for use with --key.
+    #[arg(long, value_name = "PATH", requires = "generate")]
+    save_blob: Option<std::path::PathBuf>,
 
     /// Overwrite an existing FileId::GUEST_SECRET_KEY entry.
     #[arg(long)]
@@ -338,14 +348,24 @@ fn run_bridge(args: &BridgeArgs) -> std::process::ExitCode {
 fn run_provision_gsk(args: &ProvisionGskArgs) -> std::process::ExitCode {
     let source = if let Some(p) = args.from_blob.as_ref() {
         provision::ProvisionSource::FromBlob(p.clone())
+    } else if args.generate {
+        provision::ProvisionSource::Generate
     } else {
-        unreachable!("clap ArgGroup ensures --from-blob is set")
+        eprintln!("encrypted-serial provision-gsk: specify --from-blob or --generate");
+        return std::process::ExitCode::from(1);
     };
     let result = pal_async::DefaultPool::run_with(async |_| {
         provision::provision(&args.vmgs, source, args.force).await
     });
     match result {
-        Ok(()) => {
+        Ok(blob_bytes) => {
+            if let Some(save_path) = args.save_blob.as_ref() {
+                if let Err(e) = fs_err::write(save_path, &blob_bytes) {
+                    eprintln!("encrypted-serial provision-gsk: failed to save blob: {e:#}");
+                    return std::process::ExitCode::from(1);
+                }
+                tracing::info!(path = %save_path.display(), "saved raw GSK blob");
+            }
             tracing::info!("encrypted-serial provision-gsk: wrote GUEST_SECRET_KEY");
             std::process::ExitCode::SUCCESS
         }

@@ -43,6 +43,9 @@ pub enum ProvisionSource {
     /// key). The file is validated by `ImportCmd::
     /// deserialize_no_wrapping_key` before being written.
     FromBlob(std::path::PathBuf),
+    /// Generate a fresh RSA-2048 keypair and format it as a
+    /// TPM2_Import duplicate blob.
+    Generate,
 }
 
 /// Open `vmgs_path` as a plaintext VHD-formatted VMGS, write GSK
@@ -54,7 +57,7 @@ pub async fn provision(
     vmgs_path: &Path,
     source: ProvisionSource,
     force: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     let bytes = build_payload(&source)?;
 
     tracing::info!(path = %vmgs_path.display(), "opening VMGS for read-write");
@@ -69,7 +72,8 @@ pub async fn provision(
     )
     .context("constructing Disk from VMGS VHD")?;
 
-    provision_on_disk(disk, &bytes, force).await
+    provision_on_disk(disk, &bytes, force).await?;
+    Ok(bytes.to_vec())
 }
 
 /// Provision a GSK payload into an already-opened `Disk`. Exposed
@@ -124,11 +128,20 @@ pub(crate) fn build_payload(
                     bytes.len()
                 );
             }
-            // Validate up front using the same parser the vTPM uses
-            // at first boot, so a bad blob fails here rather than
-            // breaking TPM provisioning later.
             validate_importable_blob(&bytes).context("validating --from-blob")?;
             buf[..bytes.len()].copy_from_slice(&bytes);
+        }
+        ProvisionSource::Generate => {
+            let blob = generate_tpm_import_blob().context("generating TPM import blob")?;
+            if blob.len() > GUEST_SECRET_KEY_MAX_SIZE {
+                bail!(
+                    "generated blob is {} bytes; max is {GUEST_SECRET_KEY_MAX_SIZE}",
+                    blob.len()
+                );
+            }
+            validate_importable_blob(&blob).context("validating generated blob")?;
+            buf[..blob.len()].copy_from_slice(&blob);
+            tracing::info!(len = blob.len(), "generated fresh RSA-2048 TPM import blob");
         }
     }
     Ok(buf)
@@ -150,6 +163,77 @@ pub(crate) fn validate_importable_blob(bytes: &[u8]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Generate a fresh RSA-2048 keypair and serialize it as a TPM2_Import
+/// duplicate blob (no inner wrapping key) matching the format expected
+/// by `ImportCmd::deserialize_no_wrapping_key`.
+fn generate_tpm_import_blob() -> anyhow::Result<Vec<u8>> {
+    use tpm_protocol::tpm20proto::AlgIdEnum;
+    use tpm_protocol::tpm20proto::TpmaObjectBits;
+    use tpm_protocol::tpm20proto::protocol::Tpm2bPublic;
+    use tpm_protocol::tpm20proto::protocol::TpmsRsaParams;
+    use tpm_protocol::tpm20proto::protocol::TpmtPublic;
+    use tpm_protocol::tpm20proto::protocol::TpmtRsaScheme;
+    use tpm_protocol::tpm20proto::protocol::TpmtSymDefObject;
+    use zerocopy::FromZeros as _;
+
+    let rsa = openssl::rsa::Rsa::generate(2048).context("RSA-2048 keygen failed")?;
+
+    let modulus = rsa.n().to_vec();
+    let prime_p = rsa.p().context("private key missing prime p")?.to_vec();
+
+    // Build TpmtPublic (RSA, SHA-256, sign+encrypt)
+    let symmetric = TpmtSymDefObject::new(AlgIdEnum::NULL.into(), None, None);
+    let scheme = TpmtRsaScheme::new(AlgIdEnum::RSASSA.into(), Some(AlgIdEnum::SHA256.into()));
+    let rsa_params = TpmsRsaParams::new(symmetric, scheme, 2048, 0);
+
+    let object_attributes = TpmaObjectBits::new()
+        .with_user_with_auth(true)
+        .with_sign_encrypt(true);
+
+    let mut unique = [0u8; 256];
+    let n = modulus.len().min(256);
+    unique[..n].copy_from_slice(&modulus[..n]);
+
+    let rsa_public = TpmtPublic::new(
+        AlgIdEnum::RSA.into(),
+        AlgIdEnum::SHA256.into(),
+        object_attributes,
+        &[],
+        rsa_params,
+        &unique,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to build TpmtPublic: {e:?}"))?;
+
+    let object_public = Tpm2bPublic::new(rsa_public);
+
+    // Helper: compact TPM2B serialization (u16 size + data only).
+    fn tpm2b_compact(data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 + data.len());
+        buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    // TpmtSensitive: type(u16) + authValue(TPM2B) + seedValue(TPM2B)
+    // + sensitive(TPM2B with prime P)
+    let mut sensitive_bytes = Vec::new();
+    sensitive_bytes.extend_from_slice(&(AlgIdEnum::RSA as u16).to_be_bytes());
+    sensitive_bytes.extend_from_slice(&tpm2b_compact(&[])); // authValue
+    sensitive_bytes.extend_from_slice(&tpm2b_compact(&[])); // seedValue
+    sensitive_bytes.extend_from_slice(&tpm2b_compact(&prime_p));
+
+    let duplicate_bytes = tpm2b_compact(&sensitive_bytes);
+    let in_sym_seed_bytes = tpm2b_compact(&[]);
+
+    // TPM2B_PUBLIC || TPM2B_PRIVATE || TPM2B_ENCRYPTED_SECRET
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&object_public.serialize());
+    blob.extend_from_slice(&duplicate_bytes);
+    blob.extend_from_slice(&in_sym_seed_bytes);
+
+    Ok(blob)
 }
 
 #[cfg(test)]

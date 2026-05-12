@@ -133,8 +133,12 @@ fn bridge_plain(pipe_path: &Path, wait: bool) -> anyhow::Result<()> {
     );
 
     DefaultPool::run_with(async move |driver| -> anyhow::Result<()> {
-        let io =
-            setup_bridge_io(&driver, pipe_path, wait, "encrypted-serial-bridge-plain-stdin")?;
+        let io = setup_bridge_io(
+            &driver,
+            pipe_path,
+            wait,
+            "encrypted-serial-bridge-plain-stdin",
+        )?;
         let BridgeIo {
             pipe_reader,
             pipe_writer,
@@ -185,7 +189,7 @@ fn setup_bridge_io(
     let pipe = open_pipe_waiting(pipe_path, wait)
         .with_context(|| format!("opening pipe: {pipe_path:?}"))?;
     let polled = PolledPipe::new(driver, pipe).context("wrapping pipe for async I/O")?;
-    let (pipe_reader, pipe_writer) = polled.split();
+    let (pipe_reader, pipe_writer) = AsyncReadExt::split(polled);
 
     let raw_guard = enable_raw_input_if_tty()?;
 
@@ -325,8 +329,7 @@ where
     W: futures::AsyncWrite + Unpin,
 {
     let mut session_id = [0u8; SESSION_ID_LEN];
-    getrandom::fill(&mut session_id)
-        .map_err(|e| anyhow::anyhow!("generating session_id: {e}"))?;
+    getrandom::fill(&mut session_id).map_err(|e| anyhow::anyhow!("generating session_id: {e}"))?;
     let aes_key = derive_aes_key(gks, &session_id).context("deriving AES key")?;
     let mut seq: u64 = 0;
     let mut total_in: u64 = 0;
@@ -343,11 +346,9 @@ where
         total_in += n as u64;
         for chunk in bytes.chunks(MAX_PLAINTEXT_LEN) {
             let mut nonce = [0u8; NONCE_LEN];
-            getrandom::fill(&mut nonce)
-                .map_err(|e| anyhow::anyhow!("generating nonce: {e}"))?;
+            getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("generating nonce: {e}"))?;
             let (ciphertext, tag) =
-                encrypt(&aes_key, &session_id, seq, &nonce, chunk)
-                    .context("encrypting chunk")?;
+                encrypt(&aes_key, &session_id, seq, &nonce, chunk).context("encrypting chunk")?;
             let record = Record {
                 session_id,
                 seq,
@@ -383,8 +384,7 @@ where
     }
     info!(
         total_in,
-        total_records,
-        "bridge encrypt: stdin channel closed",
+        total_records, "bridge encrypt: stdin channel closed",
     );
     Ok(())
 }
@@ -400,10 +400,7 @@ where
     let mut total: u64 = 0;
     loop {
         trace!(direction = "recv", "bridge plain: about to read");
-        let n = reader
-            .read(&mut buf)
-            .await
-            .context("reading from pipe")?;
+        let n = reader.read(&mut buf).await.context("reading from pipe")?;
         trace!(direction = "recv", n, "bridge plain: read returned");
         // Don't hold the StdoutLock across await; lock per chunk.
         let stdout = std::io::stdout();
@@ -429,16 +426,20 @@ where
     let mut total: u64 = 0;
     while let Some(bytes) = stdin_rx.next().await {
         let n = bytes.len();
-        trace!(direction = "send", bytes = n, "bridge plain: about to write");
-        writer
-            .write_all(&bytes)
-            .await
-            .context("writing to pipe")?;
+        trace!(
+            direction = "send",
+            bytes = n,
+            "bridge plain: about to write"
+        );
+        writer.write_all(&bytes).await.context("writing to pipe")?;
         trace!(direction = "send", bytes = n, "bridge plain: wrote");
         writer.flush().await.context("flushing pipe")?;
         total += n as u64;
     }
-    info!(direction = "send", total, "bridge plain: stdin channel closed");
+    info!(
+        direction = "send",
+        total, "bridge plain: stdin channel closed"
+    );
     Ok(())
 }
 
