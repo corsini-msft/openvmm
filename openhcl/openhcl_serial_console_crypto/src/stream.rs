@@ -26,8 +26,8 @@ use crate::consts::SENTINEL_CLOSE;
 use crate::consts::SENTINEL_OPEN;
 use crate::consts::SESSION_ID_LEN;
 use crate::crypto::GksKeyMaterial;
-use crate::crypto::derive_aes_key;
 use crate::crypto::decrypt as aes_decrypt;
+use crate::crypto::derive_aes_key;
 use crate::format::Record;
 use crate::format::SentinelError;
 use crate::format::SentinelMatch;
@@ -138,14 +138,13 @@ impl StreamScanner {
                     cursor = end;
                 }
                 SentinelMatch::Malformed { start, reason } => {
-                    let needs_more =
-                        !at_eof && matches!(reason, SentinelError::Unterminated) && {
-                            let max_search_end = start
-                                .saturating_add(SENTINEL_OPEN.len())
-                                .saturating_add(MAX_SENTINEL_BASE64_LEN)
-                                .saturating_add(SENTINEL_CLOSE.len());
-                            self.buf.len() < max_search_end
-                        };
+                    let needs_more = !at_eof && matches!(reason, SentinelError::Unterminated) && {
+                        let max_search_end = start
+                            .saturating_add(SENTINEL_OPEN.len())
+                            .saturating_add(MAX_SENTINEL_BASE64_LEN)
+                            .saturating_add(SENTINEL_CLOSE.len());
+                        self.buf.len() < max_search_end
+                    };
                     if needs_more {
                         if start > cursor {
                             let chunk = &self.buf[cursor..start];
@@ -268,8 +267,7 @@ mod tests {
         for (i, b) in nonce.iter_mut().enumerate() {
             *b = ((i + (seq as usize)) & 0xff) as u8;
         }
-        let (ciphertext, tag) =
-            aes_encrypt(&aes_key, &session_id, seq, &nonce, plaintext).unwrap();
+        let (ciphertext, tag) = aes_encrypt(&aes_key, &session_id, seq, &nonce, plaintext).unwrap();
         let record = Record {
             session_id,
             seq,

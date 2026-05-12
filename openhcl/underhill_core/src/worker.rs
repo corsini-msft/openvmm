@@ -2322,9 +2322,7 @@ async fn new_underhill_vm(
     // Source the encrypted-serial GSK from the VMGS when enabled.
     // Falls back to plaintext if the GSK is not provisioned.
     let encrypted_serial_gks = if env_cfg.disable_encrypted_serial {
-        tracing::info!(
-            "OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper"
-        );
+        tracing::info!("OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper");
         None
     } else if encrypted_diagnostics {
         match platform_attestation_data.guest_secret_key.as_deref() {

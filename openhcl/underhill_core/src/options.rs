@@ -402,8 +402,7 @@ impl Options {
         let framebuffer_gpa_base = parse_legacy_env_number("OPENHCL_FRAMEBUFFER_GPA_BASE")?;
         let vtl0_starts_paused = parse_legacy_env_bool("OPENHCL_VTL0_STARTS_PAUSED");
         let serial_wait_for_rts = parse_legacy_env_bool("OPENHCL_SERIAL_WAIT_FOR_RTS");
-        let disable_encrypted_serial =
-            parse_legacy_env_bool("OPENHCL_DISABLE_ENCRYPTED_SERIAL");
+        let disable_encrypted_serial = parse_legacy_env_bool("OPENHCL_DISABLE_ENCRYPTED_SERIAL");
         let nvme_vfio = parse_legacy_env_bool("OPENHCL_NVME_VFIO");
         let hide_isolation = parse_env_bool("OPENHCL_HIDE_ISOLATION");
         let halt_on_guest_halt = parse_legacy_env_bool("OPENHCL_HALT_ON_GUEST_HALT");

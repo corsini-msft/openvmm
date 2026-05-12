@@ -97,7 +97,8 @@ impl AsyncResolveResource<SerialBackendHandle, EncryptedSerialBackendHandle>
         let aes_key = derive_aes_key(&self.gks, &session_id)
             .map_err(|e| anyhow::anyhow!("failed to derive AES key: {e}"))?;
 
-        let wrapper = EncryptedSerialIo::new(inner_io, aes_key, session_id, timer, self.gks.clone());
+        let wrapper =
+            EncryptedSerialIo::new(inner_io, aes_key, session_id, timer, self.gks.clone());
         Ok(ResolvedSerialBackend(Box::new(EncryptedSerialBackend {
             wrapper,
         })))
@@ -234,10 +235,7 @@ impl InspectMut for EncryptedSerialIo {
                 self.flush_deadline
                     .map(|d| d.saturating_sub(Instant::now()).as_millis() as u64),
             )
-            .field(
-                "consumer_buffered_wire",
-                self.consumer_scanner.buffered(),
-            )
+            .field("consumer_buffered_wire", self.consumer_scanner.buffered())
             .field(
                 "consumer_plaintext_pending",
                 self.consumer_plaintext_out.len(),
@@ -413,10 +411,7 @@ impl AsyncRead for EncryptedSerialIo {
         loop {
             // 1. Return any plaintext we already decrypted.
             if !self.consumer_plaintext_out.is_empty() {
-                return Poll::Ready(Ok(copy_out(
-                    &mut self.consumer_plaintext_out,
-                    buf,
-                )));
+                return Poll::Ready(Ok(copy_out(&mut self.consumer_plaintext_out, buf)));
             }
 
             // 2. Pull more wire bytes from the inner transport.
@@ -441,10 +436,7 @@ impl AsyncRead for EncryptedSerialIo {
                 if this.consumer_plaintext_out.is_empty() {
                     return Poll::Ready(Ok(0));
                 }
-                return Poll::Ready(Ok(copy_out(
-                    &mut this.consumer_plaintext_out,
-                    buf,
-                )));
+                return Poll::Ready(Ok(copy_out(&mut this.consumer_plaintext_out, buf)));
             }
 
             // 3. Feed those bytes through the scanner.
@@ -585,8 +577,8 @@ mod tests {
     use pal_async::async_test;
     use pal_async::timer::PolledTimer;
     use parking_lot::Mutex;
-    use std::sync::Arc;
     use std::collections::VecDeque as TestVecDeque;
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// In-memory `SerialIo` backend that captures every byte written
@@ -731,13 +723,8 @@ mod tests {
         let timer = PolledTimer::new(driver);
         let session_id = test_session_id();
         let gks = Arc::new(test_gks());
-        let wrapper = EncryptedSerialIo::new(
-            Box::new(backend),
-            test_aes_key(),
-            session_id,
-            timer,
-            gks,
-        );
+        let wrapper =
+            EncryptedSerialIo::new(Box::new(backend), test_aes_key(), session_id, timer, gks);
         (wrapper, ctl)
     }
 
@@ -753,7 +740,10 @@ mod tests {
         if needle.is_empty() || haystack.len() < needle.len() {
             return 0;
         }
-        haystack.windows(needle.len()).filter(|w| *w == needle).count()
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
     }
 
     #[async_test]
@@ -936,13 +926,13 @@ mod tests {
 
     // ---- Consumer (read-side) tests ----------------------------------
 
+    use futures::AsyncReadExt;
     use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
-    use openhcl_serial_console_crypto::consts::SESSION_ID_LEN as TEST_SESSION_ID_LEN;
     use openhcl_serial_console_crypto::consts::NONCE_LEN as TEST_NONCE_LEN;
+    use openhcl_serial_console_crypto::consts::SESSION_ID_LEN as TEST_SESSION_ID_LEN;
     use openhcl_serial_console_crypto::crypto::derive_aes_key as test_derive_aes_key;
     use openhcl_serial_console_crypto::crypto::encrypt as test_encrypt;
     use openhcl_serial_console_crypto::format::Record as TestRecord;
-    use futures::AsyncReadExt;
 
     /// Build one wire-format record under the test GKS.
     fn build_inbound_record(
