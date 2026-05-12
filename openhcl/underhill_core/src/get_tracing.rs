@@ -204,14 +204,17 @@ pub fn init_tracing(spawn: impl Spawn, tracer: RemoteTracer) -> anyhow::Result<(
     let json_fmt_layer = json_layer::JsonMeshLayer::new(tracer.trace_writer);
 
     // Output nicely readable events to kmsg (and therefore also serial).
-    // TODO(encrypted-serial-poc): Stub key for development. Replace
-    // with real GSK before production.
+    // TODO(encrypted-serial-poc): Stub key for development. Uses the same
+    // test fixture blob as tpm_import_blob.bin so that a single key file
+    // works for both serial and kmsg decryption. Replace with real GSK
+    // before production.
     let kmsg_writer = {
         let inner = kmsg_writer::KmsgWriter::new(kmsg_defs::UNDERHILL_KMSG_FACILITY)?;
         let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = (i & 0xff) as u8;
-        }
+        // Embed the 422-byte test fixture (same as test_data/tpm_import_blob.bin).
+        const TEST_BLOB: &[u8] =
+            include_bytes!("../../encrypted_serial_host/test_data/tpm_import_blob.bin");
+        buf[..TEST_BLOB.len()].copy_from_slice(TEST_BLOB);
         let gks = openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf);
         crate::emuplat::encrypted_kmsg::EncryptingKmsgWriter::new(inner, &gks)
             .context("failed to create encrypting kmsg writer")?
