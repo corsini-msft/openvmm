@@ -1673,6 +1673,9 @@ impl MshvProcessor<'_> {
                     .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
                 ghcb.save.sw_exit_info1 = 0;
             }
+            exit_code if exit_code == u64::from(SVM_EXITCODE_SNP_GUEST_REQUEST) => {
+                self.handle_snp_guest_request(info)?;
+            }
             exit_code if exit_code == u64::from(SVM_EXITCODE_SNP_AP_CREATION) => {
                 self.handle_snp_ap_create(info, ghcb_gpa)?;
             }
@@ -1688,6 +1691,60 @@ impl MshvProcessor<'_> {
             }
         }
 
+        Ok(())
+    }
+
+    fn handle_snp_guest_request(
+        &mut self,
+        info: &hvdef::HvX64VmgexitInterceptMessage,
+    ) -> Result<(), VpHaltReason> {
+        let req_gpa = info.ghcb_page.standard.sw_exit_info1;
+        let rsp_gpa = info.ghcb_page.standard.sw_exit_info2;
+        let valid_page = |gpa: u64| {
+            gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+                && gpa.checked_add(hvdef::HV_PAGE_SIZE).is_some_and(|end| {
+                    self.partition
+                        .mem_layout
+                        .ram()
+                        .iter()
+                        .any(|range| range.range.contains(&MemoryRange::new(gpa..end)))
+                })
+        };
+        let gpas_valid = req_gpa != rsp_gpa && valid_page(req_gpa) && valid_page(rsp_gpa);
+
+        let ghcb = self
+            .runner
+            .ghcb_page()
+            .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+        if !ghcb_exit_info2_is_valid(ghcb) || ghcb.save.sw_exit_info2 != rsp_gpa || !gpas_valid {
+            tracelimit::warn_ratelimited!(req_gpa, rsp_gpa, "rejected invalid SNP guest request");
+            set_ghcb_error(ghcb, GHCB_ERROR_INVALID_INPUT);
+            return Ok(());
+        }
+
+        let request = mshv_bindings::mshv_issue_psp_guest_request { req_gpa, rsp_gpa };
+        if let Err(error) = self.partition.vmfd.psp_issue_guest_request(&request) {
+            tracelimit::error_ratelimited!(
+                error = &error as &dyn std::error::Error,
+                req_gpa,
+                rsp_gpa,
+                "failed to issue SNP PSP guest request"
+            );
+            let ghcb = self
+                .runner
+                .ghcb_page()
+                .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+            set_ghcb_error(ghcb, GHCB_ERROR_INVALID_INPUT);
+            return Ok(());
+        }
+
+        let ghcb = self
+            .runner
+            .ghcb_page()
+            .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+        ghcb.save.sw_exit_info1 = 0;
+        ghcb.save.sw_exit_info2 = 0;
+        ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO1_VALID_BIT | GHCB_SW_EXIT_INFO2_VALID_BIT;
         Ok(())
     }
 
