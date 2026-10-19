@@ -833,6 +833,11 @@ options:
     #[clap(long, value_name = "BUS", value_parser = parse_virtio_vsock_bus)]
     pub virtio_vsock_bus: Option<VirtioBusCli>,
 
+    /// attach the virtio-vsock device to the specified PCIe port
+    /// (overrides --virtio-vsock-bus)
+    #[clap(long, value_name = "PORT")]
+    pub virtio_vsock_pcie_port: Option<String>,
+
     /// add a virtio vsock device with the given Unix socket base path
     #[clap(long, value_name = "PATH")]
     pub virtio_vsock_path: Option<String>,
@@ -866,6 +871,11 @@ options:
     /// crashes. no file locking is performed.
     #[clap(long, value_name = "PATH")]
     pub pidfile: Option<PathBuf>,
+
+    /// run without the interactive console, until the VM exits or the process
+    /// is terminated
+    #[clap(long)]
+    pub headless: bool,
 
     /// \[deprecated\] run as a ttrpc server on the specified Unix socket
     ///
@@ -1215,6 +1225,7 @@ Options:
     `segment=<value>`              configures the PCI Express segment, default 0
     `start_bus=<value>`            lowest valid bus number, default 0
     `end_bus=<value>`              highest valid bus number, default 255
+    `ecam_base=<addr>`             pin the segment's bus-0 ECAM base address
     `low_mmio=<size>`              low MMIO window size, default 64M
     `high_mmio=<size>`             high MMIO window size, default 1G
     `low_mmio_base=<addr>`         pin low MMIO window base address (0x-prefixed hex)
@@ -3166,6 +3177,7 @@ pub struct PcieRootComplexCli {
     pub segment: u16,
     pub start_bus: u8,
     pub end_bus: u8,
+    pub ecam_base: Option<u64>,
     pub low_mmio: u32,
     pub high_mmio: u64,
     pub low_mmio_base: Option<u64>,
@@ -3212,6 +3224,7 @@ struct PcieRootComplexArgs {
     start_bus: u8,
     #[kv(default = 255)]
     end_bus: u8,
+    ecam_base: Option<HexAddress>,
     #[kv(default = vmm_cli::MemorySize(64 * 1024 * 1024))]
     low_mmio: vmm_cli::MemorySize,
     #[kv(default = vmm_cli::MemorySize(1024 * 1024 * 1024))]
@@ -3237,6 +3250,13 @@ impl FromStr for PcieRootComplexCli {
         if args.start_bus > args.end_bus {
             anyhow::bail!("start_bus must be <= end_bus");
         }
+        if args
+            .ecam_base
+            .as_ref()
+            .is_some_and(|base| !base.0.is_multiple_of(1024 * 1024))
+        {
+            anyhow::bail!("ecam_base must be 1MB-aligned");
+        }
 
         let low_mmio = u32::try_from(args.low_mmio.0).context("low MMIO size exceeds 32 bits")?;
 
@@ -3245,6 +3265,7 @@ impl FromStr for PcieRootComplexCli {
             segment: args.segment,
             start_bus: args.start_bus,
             end_bus: args.end_bus,
+            ecam_base: args.ecam_base.map(|a| a.0),
             low_mmio,
             high_mmio: args.high_mmio.0,
             low_mmio_base: args.low_mmio_base.map(|a| a.0),
@@ -4535,6 +4556,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -4553,6 +4575,7 @@ mod tests {
                 segment: 1,
                 start_bus: 0,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -4571,6 +4594,7 @@ mod tests {
                 segment: 0,
                 start_bus: 32,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -4589,6 +4613,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 31,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -4607,6 +4632,7 @@ mod tests {
                 segment: 0,
                 start_bus: 32,
                 end_bus: 127,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: 2 * ONE_GB,
                 hdm: DEFAULT_HDM,
@@ -4625,6 +4651,7 @@ mod tests {
                 segment: 2,
                 start_bus: 32,
                 end_bus: 127,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -4643,6 +4670,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: ONE_MB as u32,
                 high_mmio: 64 * ONE_GB,
                 hdm: DEFAULT_HDM,
@@ -4661,6 +4689,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: 2 * ONE_GB,
@@ -4679,6 +4708,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -4707,6 +4737,10 @@ mod tests {
         assert!(PcieRootComplexCli::from_str("rc,hdm_window_restrictions=bad").is_err());
         assert!(PcieRootComplexCli::from_str("rc,hdm_window_restrictions").is_err());
         assert!(PcieRootComplexCli::from_str("rc,cxl").is_err());
+        assert!(PcieRootComplexCli::from_str("rc,ecam_base=0x10001000").is_err());
+
+        let fixed_ecam = PcieRootComplexCli::from_str("rc,ecam_base=0x30000000").unwrap();
+        assert_eq!(fixed_ecam.ecam_base, Some(0x30000000));
 
         // node option
         assert_eq!(
@@ -4716,6 +4750,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 255,
+                ecam_base: None,
                 low_mmio: DEFAULT_LOW_MMIO,
                 high_mmio: DEFAULT_HIGH_MMIO,
                 hdm: DEFAULT_HDM,
@@ -5634,6 +5669,16 @@ mod tests {
     }
 
     #[test]
+    fn test_headless_option_parsed() {
+        assert!(!Options::try_parse_from(["openvmm"]).unwrap().headless);
+        assert!(
+            Options::try_parse_from(["openvmm", "--headless"])
+                .unwrap()
+                .headless
+        );
+    }
+
+    #[test]
     fn test_tpm_version_option() {
         let opt = Options::try_parse_from(["openvmm"]).unwrap();
         assert_eq!(opt.tpm, None);
@@ -5858,6 +5903,19 @@ mod tests {
 
         assert!(Options::try_parse_from(["openvmm", "--virtio-vsock-bus", "auto"]).is_err());
         assert!(Options::try_parse_from(["openvmm", "--virtio-vsock-bus", "vpci"]).is_err());
+    }
+
+    #[test]
+    fn test_virtio_vsock_pcie_port_cli() {
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--virtio-vsock-path",
+            "/tmp/vsock",
+            "--virtio-vsock-pcie-port",
+            "rp0",
+        ])
+        .unwrap();
+        assert_eq!(opt.virtio_vsock_pcie_port.as_deref(), Some("rp0"));
     }
 
     #[test]

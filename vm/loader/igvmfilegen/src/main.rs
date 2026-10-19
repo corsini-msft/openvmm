@@ -652,6 +652,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 processor_count,
                 memory_page_count,
                 c_bit_position,
+                pcie_host_bridge,
             } => {
                 if config.max_vtl != 0 {
                     bail!("snp_linux_direct requires max_vtl 0");
@@ -678,6 +679,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                     processor_count: *processor_count,
                     memory_page_count: *memory_page_count,
                     c_bit_position: *c_bit_position,
+                    pcie_host_bridge: pcie_host_bridge.as_ref(),
                     policy: SnpPolicy::from(*policy).with_debug(*enable_debug as u8),
                     injection_type,
                     resources: &resources,

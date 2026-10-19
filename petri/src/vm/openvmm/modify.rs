@@ -475,6 +475,7 @@ impl PetriVmConfigOpenVmm {
                     segment: segment.try_into().unwrap(),
                     start_bus: start_bus.try_into().unwrap(),
                     end_bus: end_bus.try_into().unwrap(),
+                    ecam_base: None,
                     low_mmio: PcieMmioRangeConfig::Dynamic {
                         size: LOW_MMIO_SIZE,
                     },

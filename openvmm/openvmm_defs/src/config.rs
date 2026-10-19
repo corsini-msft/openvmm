@@ -249,6 +249,8 @@ pub struct PcieRootComplexConfig {
     pub segment: u16,
     pub start_bus: u8,
     pub end_bus: u8,
+    /// Optional fixed bus-0 ECAM base address.
+    pub ecam_base: Option<u64>,
     pub low_mmio: PcieMmioRangeConfig,
     pub high_mmio: PcieMmioRangeConfig,
     pub ports: Vec<PciePortConfig>,

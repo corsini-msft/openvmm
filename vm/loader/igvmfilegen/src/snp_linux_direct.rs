@@ -16,6 +16,7 @@ use igvmfilegen_config::LinuxImage;
 use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SnpInjectionType;
+use igvmfilegen_config::SnpLinuxDirectPcieHostBridge;
 use loader::importer::BootPageAcceptance;
 use loader::importer::ImageLoad;
 use loader::importer::X86Register;
@@ -58,6 +59,8 @@ pub struct BuildParams<'a> {
     pub memory_page_count: u64,
     /// The page-table address bit used as the SNP encryption bit.
     pub c_bit_position: u8,
+    /// Optional fixed PCIe host bridge to describe in measured ACPI.
+    pub pcie_host_bridge: Option<&'a SnpLinuxDirectPcieHostBridge>,
     /// The SNP guest policy.
     pub policy: SnpPolicy,
     /// The SNP interrupt-injection mode.
@@ -74,7 +77,11 @@ struct FixedGuestLayout {
 }
 
 impl FixedGuestLayout {
-    fn new(memory_page_count: u64, processor_count: u32) -> anyhow::Result<Self> {
+    fn new(
+        memory_page_count: u64,
+        processor_count: u32,
+        pcie: Option<&SnpLinuxDirectPcieHostBridge>,
+    ) -> anyhow::Result<Self> {
         let memory_size = memory_page_count
             .checked_mul(PAGE_SIZE)
             .context("RAM size overflow")?;
@@ -84,11 +91,69 @@ impl FixedGuestLayout {
             .build(processor_count)
             .context("building processor topology")?;
 
+        let pcie_host_bridges = pcie
+            .map(|pcie| {
+                ensure!(
+                    pcie.start_bus <= pcie.end_bus,
+                    "PCIe start bus must not exceed end bus"
+                );
+                ensure!(
+                    pcie.ecam_base.is_multiple_of(1024 * 1024),
+                    "PCIe ECAM base must be 1MB-aligned"
+                );
+                let ecam_offset = u64::from(pcie.start_bus)
+                    .checked_mul(1024 * 1024)
+                    .context("PCIe ECAM offset overflow")?;
+                let ecam_size = (u64::from(pcie.end_bus - pcie.start_bus) + 1)
+                    .checked_mul(1024 * 1024)
+                    .context("PCIe ECAM size overflow")?;
+                Ok(PcieHostBridge {
+                    index: 0,
+                    segment: pcie.segment,
+                    start_bus: pcie.start_bus,
+                    end_bus: pcie.end_bus,
+                    ecam_range: Self::checked_range(
+                        pcie.ecam_base
+                            .checked_add(ecam_offset)
+                            .context("PCIe ECAM base overflow")?,
+                        ecam_size,
+                        "PCIe ECAM",
+                    )?,
+                    low_mmio: Self::checked_range(
+                        pcie.low_mmio_base,
+                        pcie.low_mmio_size,
+                        "PCIe low MMIO",
+                    )?,
+                    high_mmio: Self::checked_range(
+                        pcie.high_mmio_base,
+                        pcie.high_mmio_size,
+                        "PCIe high MMIO",
+                    )?,
+                    cxl: None,
+                    vnode: None,
+                    preserve_bars: false,
+                    preserve_boot_config: false,
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+
         Ok(Self {
             memory,
             processors,
-            pcie_host_bridges: Vec::new(),
+            pcie_host_bridges,
         })
+    }
+
+    fn checked_range(base: u64, size: u64, name: &str) -> anyhow::Result<MemoryRange> {
+        ensure!(size != 0, "{name} size must be nonzero");
+        MemoryRange::try_new(
+            base..base
+                .checked_add(size)
+                .with_context(|| format!("{name} end overflow"))?,
+        )
+        .with_context(|| format!("invalid {name} range"))
     }
 
     fn acpi_builder(&self) -> AcpiTablesBuilder<'_, X86Topology> {
@@ -184,12 +249,13 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
         processor_count,
         memory_page_count,
         c_bit_position,
+        pcie_host_bridge,
         policy,
         injection_type,
         resources,
     } = params;
 
-    let layout = FixedGuestLayout::new(memory_page_count, processor_count)?;
+    let layout = FixedGuestLayout::new(memory_page_count, processor_count, pcie_host_bridge)?;
     let acpi_builder = layout.acpi_builder();
     let (mut kernel, mut initrd) = open_linux_resources(linux, resources)?;
     let initrd_config = initrd_config(&mut initrd)?;

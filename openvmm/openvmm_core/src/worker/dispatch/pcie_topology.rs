@@ -98,6 +98,7 @@ mod tests {
             segment,
             start_bus,
             end_bus,
+            ecam_base: None,
             low_mmio: PcieMmioRangeConfig::Dynamic { size: 0 },
             high_mmio: PcieMmioRangeConfig::Dynamic { size: 0 },
             ports: Vec::new(),

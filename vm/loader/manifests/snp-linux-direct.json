@@ -21,7 +21,17 @@
                         "command_line": "console=ttyS0 earlyprintk=serial earlycon panic=-1"
                     },
                     "memory_page_count": 40960,
-                    "c_bit_position": 51
+                    "c_bit_position": 51,
+                    "pcie_host_bridge": {
+                        "segment": 0,
+                        "start_bus": 0,
+                        "end_bus": 1,
+                        "ecam_base": 4141875200,
+                        "low_mmio_base": 4143972352,
+                        "low_mmio_size": 16777216,
+                        "high_mmio_base": 4294967296,
+                        "high_mmio_size": 1048576
+                    }
                 }
             }
         }

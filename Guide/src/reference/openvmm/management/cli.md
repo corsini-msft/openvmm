@@ -251,6 +251,8 @@ describes the source definitions.
   guest RAM (the default memory backing). It uses identity-mapped DMA and
   does not support a non-identity virtual IOMMU. It conflicts with
   `--virtio-vsock-path`.
+* `--headless`: Run without the interactive console until the VM exits or the
+  process is terminated. This is intended for process supervisors.
 * `--vhost-user <SOCKET_PATH>,type=<TYPE>[,tag=<NAME>][,num_queues=<N>][,queue_size=<N>][,pcie_port=<PORT>]`: Attach a
   vhost-user device backed by an external process over a Unix socket (Linux
   only). The backend process must already be listening on `SOCKET_PATH`.
@@ -359,6 +361,8 @@ complex name:
 - `segment=<N>`: PCIe segment number for the root complex.
 - `start_bus=<N>` and `end_bus=<N>`: inclusive bus range assigned to that
   root complex.
+- `ecam_base=<ADDR>`: fixes the segment's bus-zero ECAM base. The address must
+  be 1 MiB aligned. Root complexes in the same segment must use the same base.
 - `low_mmio=<SIZE>` and `high_mmio=<SIZE>`: low/high MMIO window sizes.
 - `low_mmio_base=<ADDR>` and `high_mmio_base=<ADDR>`: pin the low/high
   MMIO window to a fixed base address instead of letting the VM topology
@@ -493,11 +497,14 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 --virtio-pmem pcie_port=rp0:/path/to/file
 ```
 
-For `--virtio-rng` and `--virtio-console`, use their separate PCIe port flags:
+For `--virtio-rng`, `--virtio-console`, and `--virtio-vsock-*`, use their
+separate PCIe port flags:
 
 ```sh
 --virtio-rng --virtio-rng-pcie-port rp0
 --virtio-console console --virtio-console-pcie-port rp0
+--virtio-vsock-vhost-cid 4051 \
+  --virtio-vsock-pcie-port rp0
 ```
 
 **vhost-user devices** (comma-separated option, Linux only): `--vhost-user`

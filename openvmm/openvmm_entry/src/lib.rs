@@ -1010,6 +1010,7 @@ async fn vm_config_from_command_line(
             segment: rc_cli.segment,
             start_bus: rc_cli.start_bus,
             end_bus: rc_cli.end_bus,
+            ecam_base: rc_cli.ecam_base,
             low_mmio: if let Some(base) = rc_cli.low_mmio_base {
                 PcieMmioRangeConfig::Fixed(
                     memory_range::MemoryRange::try_new(base..base.wrapping_add(low_mmio_size))
@@ -1990,12 +1991,30 @@ async fn vm_config_from_command_line(
         }
     }
 
+    let mut has_virtio_vsock_backend = opt.virtio_vsock_path.is_some();
+    #[cfg(target_os = "linux")]
+    {
+        has_virtio_vsock_backend |= opt.virtio_vsock_vhost_cid.is_some();
+    }
+    if opt.virtio_vsock_pcie_port.is_some() && !has_virtio_vsock_backend {
+        anyhow::bail!("`--virtio-vsock-pcie-port` requires a virtio-vsock backend");
+    }
+
     let virtio_vsock_bus = opt.virtio_vsock_bus.unwrap_or(VirtioBusCli::Auto);
+    let mut add_virtio_vsock_device = |resource: Resource<VirtioDeviceHandle>| {
+        if let Some(pcie_port) = &opt.virtio_vsock_pcie_port {
+            pcie_devices.push(PcieDeviceConfig {
+                port_name: pcie_port.clone(),
+                resource: VirtioPciDeviceHandle(resource).into_resource(),
+            });
+        } else {
+            add_virtio_device(virtio_vsock_bus, resource);
+        }
+    };
 
     if let Some(vsock_path) = &opt.virtio_vsock_path {
         let listener = vsock_listener(Some(vsock_path))?.unwrap();
-        add_virtio_device(
-            virtio_vsock_bus,
+        add_virtio_vsock_device(
             virtio_resources::vsock::VirtioVsockHandle {
                 // The guest CID does not matter since the UDS relay does not use it. It just needs
                 // to be some non-reserved value for the guest to use.
@@ -2015,8 +2034,7 @@ async fn vm_config_from_command_line(
             .open("/dev/vhost-vsock")
             .context("failed to open /dev/vhost-vsock")?
             .into();
-        add_virtio_device(
-            virtio_vsock_bus,
+        add_virtio_vsock_device(
             virtio_resources::vsock::VirtioVsockVhostHandle { vhost, guest_cid }.into_resource(),
         );
     }
@@ -2977,6 +2995,7 @@ async fn run_control_inner(
     // Run the REPL with shareable resources.
     let repl_result = repl::run_repl(
         driver,
+        !opt.headless,
         repl::ReplResources {
             vm_rpc,
             vm_controller: vm_controller_send,

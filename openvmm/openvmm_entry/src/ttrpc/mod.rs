@@ -1842,6 +1842,7 @@ async fn build_pcie_topology(
             segment: segment.try_into().context("segment out of range")?,
             start_bus: start_bus.try_into().context("start_bus out of range")?,
             end_bus: end_bus.try_into().context("end_bus out of range")?,
+            ecam_base: None,
             low_mmio: pcie_mmio_range_config(low_mmio, low_mmio_base)?,
             high_mmio: pcie_mmio_range_config(high_mmio, high_mmio_base)?,
             ports,

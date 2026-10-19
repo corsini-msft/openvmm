@@ -335,6 +335,7 @@ async fn pcie_device_numa_affinity(
                     segment: 0,
                     start_bus: 0,
                     end_bus: 255,
+                    ecam_base: None,
                     low_mmio: PcieMmioRangeConfig::Dynamic {
                         size: 64 * 1024 * 1024,
                     },

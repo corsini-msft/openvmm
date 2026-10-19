@@ -217,11 +217,20 @@ pub(super) fn resolve_memory_layout(
         segment: u16,
         min_bus: u8,
         max_bus: u8,
+        bus0_base: Option<u64>,
         range: MemoryRange,
     }
     let mut segment_ecams: Vec<SegmentEcam> = Vec::new();
     for rc in input.pcie_root_complexes {
         if let Some(entry) = segment_ecams.iter_mut().find(|e| e.segment == rc.segment) {
+            if let (Some(existing), Some(requested)) = (entry.bus0_base, rc.ecam_base) {
+                anyhow::ensure!(
+                    existing == requested,
+                    "PCIe root complexes on segment {} specify conflicting ECAM bases",
+                    rc.segment
+                );
+            }
+            entry.bus0_base = entry.bus0_base.or(rc.ecam_base);
             entry.min_bus = entry.min_bus.min(rc.start_bus);
             entry.max_bus = entry.max_bus.max(rc.end_bus);
         } else {
@@ -229,6 +238,7 @@ pub(super) fn resolve_memory_layout(
                 segment: rc.segment,
                 min_bus: rc.start_bus,
                 max_bus: rc.end_bus,
+                bus0_base: rc.ecam_base,
                 range: MemoryRange::EMPTY,
             });
         }
@@ -245,13 +255,25 @@ pub(super) fn resolve_memory_layout(
     };
     for se in &mut segment_ecams {
         let bus_count = u64::from(se.max_bus - se.min_bus) + 1;
-        builder.request(
-            format!("pcie-seg{}-ecam", se.segment),
-            &mut se.range,
-            bus_count * PCIE_ECAM_BYTES_PER_BUS,
-            PCIE_ECAM_BYTES_PER_BUS,
-            ecam_placement,
-        );
+        let size = bus_count * PCIE_ECAM_BYTES_PER_BUS;
+        if let Some(bus0_base) = se.bus0_base {
+            let start = bus0_base
+                .checked_add(u64::from(se.min_bus) * PCIE_ECAM_BYTES_PER_BUS)
+                .context("PCIe ECAM base overflow")?;
+            se.range = MemoryRange::try_new(
+                start..start.checked_add(size).context("PCIe ECAM end overflow")?,
+            )
+            .context("invalid fixed PCIe ECAM range")?;
+            builder.fixed(format!("pcie-seg{}-ecam", se.segment), se.range);
+        } else {
+            builder.request(
+                format!("pcie-seg{}-ecam", se.segment),
+                &mut se.range,
+                size,
+                PCIE_ECAM_BYTES_PER_BUS,
+                ecam_placement,
+            );
+        }
     }
 
     for (root_complex, ranges) in input
@@ -673,6 +695,7 @@ mod tests {
             segment: 0,
             start_bus: 0,
             end_bus: 0,
+            ecam_base: None,
             low_mmio,
             high_mmio,
             ports: Vec::new(),
@@ -802,6 +825,7 @@ mod tests {
                 segment: 0,
                 start_bus: 0,
                 end_bus: 15,
+                ecam_base: None,
                 low_mmio: PcieMmioRangeConfig::Dynamic { size: 32 * MB },
                 high_mmio: PcieMmioRangeConfig::Dynamic { size: GB },
                 ports: Vec::new(),
@@ -816,6 +840,7 @@ mod tests {
                 segment: 0,
                 start_bus: 16,
                 end_bus: 31,
+                ecam_base: None,
                 low_mmio: PcieMmioRangeConfig::Dynamic { size: 32 * MB },
                 high_mmio: PcieMmioRangeConfig::Dynamic { size: GB },
                 ports: Vec::new(),
@@ -854,6 +879,7 @@ mod tests {
             segment: 0,
             start_bus: 0,
             end_bus: 255,
+            ecam_base: None,
             low_mmio: PcieMmioRangeConfig::Dynamic { size: 64 * MB },
             high_mmio: PcieMmioRangeConfig::Dynamic { size: GB },
             ports: Vec::new(),

@@ -134,7 +134,24 @@ pub enum Image {
         memory_page_count: u64,
         /// The page-table address bit used as the SNP encryption bit.
         c_bit_position: u8,
+        /// Optional fixed PCIe host bridge described by the measured ACPI
+        /// tables.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pcie_host_bridge: Option<SnpLinuxDirectPcieHostBridge>,
     },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnpLinuxDirectPcieHostBridge {
+    pub segment: u16,
+    pub start_bus: u8,
+    pub end_bus: u8,
+    /// ECAM base address for bus zero.
+    pub ecam_base: u64,
+    pub low_mmio_base: u64,
+    pub low_mmio_size: u64,
+    pub high_mmio_base: u64,
+    pub high_mmio_size: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -431,6 +448,7 @@ mod test {
             processor_count,
             memory_page_count,
             c_bit_position,
+            pcie_host_bridge: None,
         }
     }
 
@@ -468,6 +486,7 @@ mod test {
                 processor_count,
                 memory_page_count,
                 c_bit_position,
+                pcie_host_bridge,
             } => {
                 assert!(linux.use_initrd);
                 assert_eq!(
@@ -477,6 +496,7 @@ mod test {
                 assert_eq!(*processor_count, 1);
                 assert_eq!(*memory_page_count, 40960);
                 assert_eq!(*c_bit_position, 51);
+                assert!(pcie_host_bridge.is_some());
                 guest.image.validate().unwrap();
             }
             image => panic!("unexpected image: {image:?}"),
